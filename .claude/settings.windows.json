@@ -1,0 +1,47 @@
+{
+  "_comment": "Windows PowerShell 5.1 fallback settings. Copy to settings.json (team-wide) or settings.local.json (per-developer) only when PowerShell 7 is unavailable. Windows is the supported execution platform.",
+  "env": {
+    "CLAUDE_CODE_USE_POWERSHELL_TOOL": "1"
+  },
+  "defaultShell": "powershell",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/session-start.ps1", "shell": "powershell" }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/route-prompt.ps1", "shell": "powershell" }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/guard.ps1 ; exit $LASTEXITCODE", "shell": "powershell" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/post-write.ps1 ; exit $LASTEXITCODE", "shell": "powershell", "timeout": 90 },
+          { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/audit-trail.ps1", "shell": "powershell" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/boy-scout-check.ps1", "shell": "powershell" }
+        ]
+      }
+    ]
+  }
+}

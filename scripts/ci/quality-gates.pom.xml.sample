@@ -1,0 +1,120 @@
+<!--
+  Deterministic standards floor - scaffolded by the `enforce-standards` skill.
+  Merge the plugins below into the evidenced pom.xml <build><plugins> (or the parent POM that already owns
+  the build configuration). Leanness: do not duplicate a plugin the repository already configures, and omit
+  a <version> that the evidenced parent or BOM already manages.
+
+  Every plugin below is independent and applies only if the team agrees to it or the repository already
+  evidences it. The compiler settings are the floor; the others each need the team's agreement and, for
+  static analysis, an agreed rule set. The Checkstyle, PMD and SpotBugs checks bind to the verify phase,
+  so the required build must invoke verify (or later), not just test.
+
+  A skipped test (@Disabled in JUnit 5, @Ignore in JUnit 4) is not a Maven setting: the ArchUnit sample
+  scripts/ci/ArchitectureTest.java.sample carries that rule, so it fails the build for every developer and in CI.
+
+  Brownfield note: if the existing warning count is large, start with specific -Xlint categories (for
+  example -Xlint:deprecation,unchecked) instead of -Xlint:all, record the rest in TECH_DEBT.md, and ratchet.
+-->
+<plugins>
+
+  <!-- Compiler: javac lint warnings fail the build. Keep the repository's evidenced release/toolchain
+       settings; this adds only the lint and fail-on-warning behaviour. -->
+  <plugin>
+    <groupId>org.apache.maven.plugins</groupId>
+    <artifactId>maven-compiler-plugin</artifactId>
+    <version>3.14.1</version>
+    <configuration>
+      <failOnWarning>true</failOnWarning>
+      <compilerArgs>
+        <arg>-Xlint:all</arg>
+      </compilerArgs>
+    </configuration>
+  </plugin>
+
+  <!-- Enforcer (optional, only if the team agrees): fail on divergent transitive dependency versions.
+       Further rules such as banDuplicateClasses (needs org.codehaus.mojo:extra-enforcer-rules) or
+       bannedDependencies are likewise optional. -->
+  <plugin>
+    <groupId>org.apache.maven.plugins</groupId>
+    <artifactId>maven-enforcer-plugin</artifactId>
+    <version>3.6.2</version>
+    <executions>
+      <execution>
+        <id>enforce-dependency-convergence</id>
+        <goals>
+          <goal>enforce</goal>
+        </goals>
+        <configuration>
+          <rules>
+            <dependencyConvergence/>
+          </rules>
+        </configuration>
+      </execution>
+    </executions>
+  </plugin>
+
+  <!-- Checkstyle (only if the team agrees or the repository already evidences it): any violation of
+       warning severity or higher fails the build. Point configLocation at the repository's evidenced
+       Checkstyle configuration; the plugin's default rule set is not a team standard. The plugin bundles an
+       older Checkstyle that cannot parse newer Java syntax; to use the version the repository evidences,
+       add a dependency on com.puppycrawl.tools:checkstyle under this plugin. -->
+  <plugin>
+    <groupId>org.apache.maven.plugins</groupId>
+    <artifactId>maven-checkstyle-plugin</artifactId>
+    <version>3.6.0</version>
+    <configuration>
+      <configLocation>checkstyle.xml</configLocation>
+      <failOnViolation>true</failOnViolation>
+      <violationSeverity>warning</violationSeverity>
+    </configuration>
+    <executions>
+      <execution>
+        <id>checkstyle-check</id>
+        <goals>
+          <goal>check</goal>
+        </goals>
+      </execution>
+    </executions>
+  </plugin>
+
+  <!-- PMD (only if the team agrees or the repository already evidences it): violations fail the build.
+       The plugin's default rule set applies unless a <rulesets> element points at the repository's
+       evidenced PMD rule set. -->
+  <plugin>
+    <groupId>org.apache.maven.plugins</groupId>
+    <artifactId>maven-pmd-plugin</artifactId>
+    <version>3.28.0</version>
+    <configuration>
+      <failOnViolation>true</failOnViolation>
+      <printFailingErrors>true</printFailingErrors>
+    </configuration>
+    <executions>
+      <execution>
+        <id>pmd-check</id>
+        <goals>
+          <goal>check</goal>
+        </goals>
+      </execution>
+    </executions>
+  </plugin>
+
+  <!-- SpotBugs (only if the team agrees or the repository already evidences it): bugs found fail the
+       build. Use a plugin version whose SpotBugs release reads this repository's Java class-file level. -->
+  <plugin>
+    <groupId>com.github.spotbugs</groupId>
+    <artifactId>spotbugs-maven-plugin</artifactId>
+    <version>4.9.8.5</version>
+    <configuration>
+      <failOnError>true</failOnError>
+    </configuration>
+    <executions>
+      <execution>
+        <id>spotbugs-check</id>
+        <goals>
+          <goal>check</goal>
+        </goals>
+      </execution>
+    </executions>
+  </plugin>
+
+</plugins>

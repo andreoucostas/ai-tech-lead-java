@@ -1,0 +1,226 @@
+﻿# UserPromptSubmit router -- classify natural-language prompts into a workflow
+# and format the matching workflow's deterministic rails for hook output.
+# Prompt-routing hook for the supported native Windows PowerShell topology.
+# For Claude-shaped input this script emits plain stdout; for other JSON input it emits top-level
+# and wrapped JSON additionalContext shapes. Emission and registration do not prove host firing or
+# consumption; current VS Code prompt-hook lifecycles are unverified. See docs/enforcement-surfaces.md.
+# Skips when the user explicitly invoked a slash command (already deterministic).
+#
+# Unicode rendered text is intentional. The mandatory UTF-8
+# BOM keeps Windows PowerShell 5.1 decoding these strings correctly.
+
+$ErrorActionPreference = 'SilentlyContinue'
+
+# Emit UTF-8 when captured: consuming harnesses read raw bytes, and the default
+# [Console]::OutputEncoding (the OEM code page on Windows) would mangle ⚠/—/🔴 into '?'.
+# Guarded so an interactive console's code page is never changed.
+if ([Console]::IsOutputRedirected) {
+    [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+}
+
+# Rails are defined at module level so here-string close markers ('@) sit at
+# column 0, which Windows PowerShell requires.
+
+$railsFix = @'
+1. Diagnose root cause first; state it before writing any code.
+2. When the repository evidences an applicable test harness, write a failing regression test BEFORE touching production code; otherwise reproduce with the strongest evidenced validation and report tests as not available — never introduce a foreign harness solely for this fix.
+3. Scope edits to requested behavior, existing caller/extension compatibility, or meaningful verification; requested cleanup/refactoring is allowed. A touched file authorizes no other cleanup/TODO. Check changed public/protected and virtual/override contracts for unrequested breaks.
+4. Derive exact regression and suite commands plus applicable build, test, format, lint, migration/deploy, and data-validation commands from repository evidence; run only safely executable applicable commands under the execution boundary above and report each unsupported category as not available.
+5. Apply only Boy Scout work allowed by step 3.
+6. Report root cause, fix, regression-test coverage, blast radius.
+'@
+
+$railsFeature = @'
+1. Design check first — list affected layers, files to create/modify, failure modes, and the smallest useful tests when an applicable harness exists; never add a harness incidentally.
+2. Decompose into ordered subtasks; derive exact build, test, format, lint, migration/deploy, and data-validation commands from repository evidence, then run only safely executable applicable commands under the execution boundary above after each before continuing (report unsupported categories as not available).
+3. Apply Boy Scout to every file you touch.
+4. Self-review against AGENTS.md > Conventions; flag new patterns or resolved tech debt.
+5. Present what was implemented and tested.
+
+Leanness constraints (the framework rules (`.github/instructions/framework-rules.instructions.md` › Leanness)):
+- Place code by responsibility (Leanness #1): a new responsibility gets its own service or class even with one consumer; never bolt it onto the nearest service or subclass one.
+- Preserve a project-evidenced service seam; otherwise add no interface, abstract class, or generic helper without a second consumer or correctness need. State the evidence.
+- Wrappers must add behavior. Inline shallow delegates.
+- No defensive code for impossible states; no comments that restate code; no future-proofing.
+'@
+
+$railsRefactor = @'
+1. Derive exact build, test, format, lint, migration/deploy, and data-validation commands from repository evidence and establish a green baseline BEFORE touching anything; report unsupported categories as not available.
+2. If the repository has an applicable test harness but the target lacks coverage, write baseline tests FIRST; otherwise report tests as not available, use the strongest evidenced validation, and never introduce a foreign harness solely for this refactor.
+3. Refactor incrementally; run applicable checks after each meaningful change.
+4. Apply Boy Scout to every file you touched.
+5. Verify final state — no behavior should have changed.
+6. Present a before/after summary INCLUDING net LOC delta.
+
+Leanness constraints (the framework rules (`.github/instructions/framework-rules.instructions.md` › Leanness)):
+- Trend toward less code: delete dead branches, inline single-use interfaces, abstract bases, wrappers and helpers, remove now-redundant types.
+- A refactor that grows the codebase needs an explicit reason in the summary.
+- Do not introduce new interfaces, helpers, or wrappers as part of a refactor unless they replace at least as much code as they add.
+'@
+
+$railsTest = @'
+1. Match existing test structure, naming convention, framework, and mocking approach.
+2. Choose the smallest risk-relevant set: the principal behavior plus only consequential error, edge, or boundary cases; do not build a case matrix for its own sake.
+3. Do not test framework behavior — test public behavior only.
+4. See each new behavioral test fail correctly before trusting it.
+5. Derive exact applicable build, test, format, lint, migration/deploy, and data-validation commands from repository evidence; run only safely executable applicable commands under the execution boundary above and report every unsupported category as not available.
+6. Report what was tested and what's still uncovered.
+'@
+
+$railsDesign = @'
+**DO NOT WRITE ANY CODE.** Produce a design document only.
+1. Understand the requirement — goal, users, acceptance criteria, scope boundary.
+2. Analyse impact — layers affected, files changing, patterns to reuse.
+3. Consider at least two approaches with pros/cons and effort estimates.
+4. Recommend, with specifics — component structure, state, services, tests.
+5. Surface open questions for the developer to answer before /feature.
+'@
+
+$railsDebt = @'
+1. Read TECH_DEBT.md, including dismissed-proposal decision memory, and find active items in the specified area.
+2. Confirm each item still exists in the code (it may have been fixed already).
+3. Derive applicable tests and other validation from repository evidence; when no test harness exists, report tests as not available and use the strongest evidenced validation — never introduce a foreign harness solely for debt cleanup.
+4. Recommend fix-now vs defer per item, with reason.
+5. After fixes: update TECH_DEBT.md — remove resolved items, preserve dismissals, and do not re-propose one without naming materially changed evidence.
+6. Apply Boy Scout to every file touched.
+7. Report what was fixed/deferred plus the validation results and updated TECH_DEBT diff.
+'@
+
+$railsReview = @'
+This is a quality gate, not a rubber stamp.
+1. Check correctness and every AGENTS.md > Conventions item per changed file.
+2. Check test quality — behavior coverage, descriptive names, regression detection.
+3. Derive and run only safely executable build, test, format, lint, migration/deploy, and data-validation commands supported by repository evidence yourself, subject to the execution boundary above; do not trust they pass, and report unsupported categories as not available.
+4. Check architecture/debt and task scope. For fixes, reject touch-only cleanup and unrequested public/protected or virtual/override breaks.
+Output: APPROVE or REQUEST CHANGES with a severity-tagged issues table.
+'@
+
+$railsSecurity = @'
+## Security-sensitive surface detected
+
+This prompt touches a security- or money-sensitive area (auth, payments, balances, ledgers, idempotency, secrets). DORA's evidence is that AI amplifies existing weaknesses fastest here, so this overlay applies ON TOP OF any workflow rails above. Before presenting the change as complete:
+1. Run /security-review on the diff (or invoke the security-auditor agent) — do not self-certify.
+2. Financial logic: establish the applicable invariant, tolerance, and preconditions from policy, implementation, tests, or executable evidence; preserve demonstrated negative-amount, duplicate-effect, precision/rounding, and temporal controls. A type or mechanism name alone is not a verdict.
+3. For state changes, inspect the actual atomic, optimistic, or idempotency mechanism and relevant interleaving; report an unsafe outcome or scoped policy violation demonstrated by source, interleaving, or executable evidence, otherwise retain uncertainty.
+4. Record anything you could not fully verify in SECURITY_FINDINGS.md.
+If this prompt does NOT actually touch a sensitive surface, say so and skip this overlay.
+'@
+
+$railsPlanGate = @'
+## Plan gate (present -> clarify -> confirm)
+Before writing code: post a short plan (files to change, order of operations, how you'll verify) AND any clarifying questions for whatever is underspecified — do not guess past a material ambiguity to seem helpful. Then WAIT for the developer's explicit go-ahead before editing code. Skip the wait only for a trivial, unambiguous change (typo, one-liner), and say that you're skipping it and why.
+'@
+
+$railsExecutionSafety = @'
+## Verification execution boundary
+Derive all six command categories, but run only safely executable verification. A recorded migration/deploy command is manual/CI-only unless repository evidence identifies that exact invocation as non-mutating validation/dry-run, or the developer explicitly authorizes execution against a known target. Otherwise report it as recorded but not run.
+'@
+
+$inputJson = [Console]::In.ReadToEnd()
+if ([string]::IsNullOrEmpty($inputJson)) { exit 0 }
+$isClaude = $inputJson -match '"hook_event_name"'
+
+# Try ConvertFrom-Json first (handles escapes correctly); fall back to regex if it fails.
+$prompt = ''
+try {
+    $obj = $inputJson | ConvertFrom-Json
+    if ($obj -and $obj.prompt) { $prompt = [string]$obj.prompt }
+} catch {
+    if ($inputJson -match '"prompt"\s*:\s*"([^"]*)"') {
+        $prompt = $Matches[1]
+    }
+}
+if ([string]::IsNullOrEmpty($prompt) -and $isClaude) { exit 0 }
+
+# Skip if the user already chose a workflow.
+if ($prompt.StartsWith('/') -and $isClaude) { exit 0 }
+
+$routeEligible = -not [string]::IsNullOrEmpty($prompt) -and -not $prompt.StartsWith('/')
+$lc = if ($routeEligible) { $prompt.ToLower() } else { '' }
+
+# Priority order: review > debt > design > test > fix > refactor > feature
+$intent = ''
+if     ($lc -match '(review this|review the|review my (changes|pr|code)|quality gate)')                                                   { $intent = 'review' }
+elseif ($lc -match '(tech debt|technical debt|cleanup debt|debt (in|register))')                                                          { $intent = 'debt' }
+elseif ($lc -match "(how should i|what'?s the best way|design (a|the)|approach (for|to)|how would you|trade.?offs?)")                     { $intent = 'design' }
+elseif ($lc -match '(write tests?|add tests?|test coverage|increase coverage|generate tests?)')                                            { $intent = 'test' }
+elseif ($lc -match '(\bfix\b|\bbug\b|\bbroken\b|\bcrash|\bfails?\b|\bfailing\b|\bthrows?\b|\bthrowing\b|\bregression\b|not working)')      { $intent = 'fix' }
+elseif ($lc -match '(\brefactor\b|cleanup|clean up|\bextract\b|\brename\b|simplify|reorganis[ez]|restructure|\btidy\b)')                  { $intent = 'refactor' }
+elseif ($lc -match '(\badd\b|\bimplement\b|\bcreate\b|\bbuild\b|new (feature|endpoint|component|service|screen|route))')                  { $intent = 'feature' }
+
+# Answer-only carve-out (framework rules, Agentic Workflow section 1): a question-shaped prompt with no
+# imperative verb asks for an explanation, not a code change -- don't impose workflow
+# ceremony. Clearing $intent suppresses the rails + plan-gate; the security overlay
+# below still fires if the question touches a sensitive surface.
+$isQuestion = ($lc -match "^\s*(why|what|what'?s|how come|when|where|which|who|is|are|does|do|can|could|would|should)\b") -or ($prompt.TrimEnd() -match '\?$')
+$hasImperative = $lc -match '\b(add|fix|implement|create|build|make|change|update|modify|remove|delete|refactor|rename|extract|write|test|review|clean\s?up|migrate|wire|integrate|introduce)\b'
+if ($isQuestion -and -not $hasImperative -and $intent -in @('fix','feature','refactor','test','debt')) { $intent = '' }
+
+# Security overlay fires IN ADDITION to any workflow intent -- it is not an
+# exclusive intent, so a security-relevant feature still gets the feature rails.
+$sensitive = $lc -match '(payment|balance|ledger|transaction|transfer|\bdebit\b|\bcredit\b|refund|settle|idempotenc|reconcil|\bauth\b|authenticat|authori[sz]|login|password|secret|token|credential|session|cookie|\bjwt\b|\bcsrf\b|\bcors\b|permission|\brole\b|\bpii\b|personal data|encrypt|decrypt|deserializ|money|currency)'
+
+if ([string]::IsNullOrEmpty($intent) -and -not $sensitive -and $isClaude) { exit 0 }
+
+$parts = New-Object System.Collections.Generic.List[string]
+if (-not [string]::IsNullOrEmpty($intent)) {
+    $parts.Add("## Routed intent: ``$intent``")
+    $parts.Add('')
+    $parts.Add("This natural-language prompt was classified as **$intent**. The rails below mirror the framework rules (``.github/instructions/framework-rules.instructions.md`` › Agentic Workflow) section 1 — the canonical definition, already in your context; they are repeated here for salience. Apply them before responding. If the actual intent differs, say so and proceed normally.")
+    $parts.Add('')
+    $parts.Add($railsExecutionSafety)
+    $parts.Add('')
+
+    if ($intent -in @('fix','feature','refactor','test')) {
+        $parts.Add($railsPlanGate)
+    }
+
+    switch ($intent) {
+        'fix'      { $parts.Add($railsFix) }
+        'feature'  { $parts.Add($railsFeature) }
+        'refactor' { $parts.Add($railsRefactor) }
+        'test'     { $parts.Add($railsTest) }
+        'design'   { $parts.Add($railsDesign) }
+        'debt'     { $parts.Add($railsDebt) }
+        'review'   { $parts.Add($railsReview) }
+    }
+}
+
+if ($sensitive) {
+    $parts.Add($railsSecurity)
+}
+
+$body = ($parts -join "`n")
+
+# Surface dispatch. `hook_event_name` selects plain stdout. Other input selects top-level and
+# hookSpecificOutput-wrapped UserPromptSubmit additionalContext JSON after queued Boy Scout text is
+# merged. These are script-emitted shapes only: registration and output do not prove that a host
+# fired the event or consumed the result. Current VS Code prompt-hook lifecycles are unverified;
+# dated CLI evidence is recorded in docs/enforcement-surfaces.md.
+if ($inputJson -match '"hook_event_name"') {
+    Write-Output $body
+} else {
+    $candidateRoot = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) '..\..'))
+    $repoRoot = (& git -C $candidateRoot rev-parse --show-toplevel 2>$null | Select-Object -First 1)
+    $queuedText = ''
+    if ($repoRoot) {
+        $repoRoot = [IO.Path]::GetFullPath($repoRoot.Trim())
+        $queueFile = Join-Path $repoRoot '.claude\.state\boy-scout-queue'
+        if (Test-Path -LiteralPath $queueFile) {
+            $queuedText = [string](Get-Content -LiteralPath $queueFile -Raw)
+            Remove-Item -LiteralPath $queueFile -Force
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($queuedText)) {
+        if (-not [string]::IsNullOrEmpty($body)) { $body += "`n" }
+        $body += $queuedText
+    }
+    if ([string]::IsNullOrEmpty($body)) { exit 0 }
+    $payload = @{
+        additionalContext  = $body
+        hookSpecificOutput = @{ hookEventName = 'UserPromptSubmit'; additionalContext = $body }
+    }
+    Write-Output ($payload | ConvertTo-Json -Compress -Depth 4)
+}
+
+exit 0

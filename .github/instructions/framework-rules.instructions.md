@@ -1,0 +1,129 @@
+---
+applyTo: "**"
+---
+
+<!-- FRAMEWORK-OWNED — replaced wholesale by the installer on every update. Do not edit.
+     Repo-specific rules belong in AGENTS.md (Conventions, Boy Scout Rule). -->
+
+## Verification Rules
+
+These apply to every workflow, before any convention-level rule. The difference between confident output and hallucinated output.
+
+1. **Verify before you reference.** Before naming a class, method, file, route, Maven/Gradle dependency, package, or bean registration, confirm it exists in this codebase via `Read` / `Grep`. If you cannot confirm, say so explicitly rather than guessing.
+2. **Never invent APIs.** Do not fabricate method signatures, type names, annotations, package exports, or framework features. Read the source. If a referenced shared-library API is not in `FRAMEWORK-CONTEXT.md > Detected Framework Packages` at the version this repo pins, treat it as unverified.
+3. **Honour version pinning.** Before suggesting a feature from a shared library, framework, or `org.springframework.*` or `jakarta.*` package, confirm the version in `FRAMEWORK-CONTEXT.md > Detected Framework Packages` actually has it. The latest API surface in `Shared Libraries` may not exist in older versions.
+4. **State uncertainty.** When a question depends on context you do not have (a file you have not read, runtime behaviour you cannot observe, a database state you cannot query), say so. Do not guess to seem helpful.
+5. **Tests are immutable safety nets during fixes and refactors.** When an existing test fails, production is wrong (or the test is wrong for a documented reason). Do not edit assertions to make them pass without flagging it explicitly.
+6. **No invented fixtures.** When sample data, builders, factories, or mocks already exist, reuse them. Do not fabricate parallel ones.
+7. **Failures are signals.** Build, test, or analyser failures are diagnostic. Read the message and fix the cause; never wrap in try/catch or add `// NOSONAR`, `// NOPMD`, `// CHECKSTYLE:OFF`, `@SuppressFBWarnings`, or `@SuppressWarnings("all")` to silence. (A PreToolUse hook hard-blocks **editor/file writes** that add such suppressions; writes routed through a terminal tool are not intercepted — see `docs/enforcement-surfaces.md`.)
+
+**Verification command discovery.** For **build**, **test**, **format**, **lint**, **migration/deploy**, and **data-validation**, use exact applicable repository-evidenced commands (`AGENTS.md`, CI, scripts, manifests, or configuration); mark missing categories **not available**. `framework-owned/overwritten` paths in `framework-ownership.json` and paths in `framework-retirements.json` are framework, not application-command, evidence. Run them only when named by an explicit framework workflow or requested for framework diagnosis; report separately from application verification. Do not run a saved Verification Commands row naming one — flag `/rebootstrap`. Migration/deploy is **manual/CI-only** unless its exact command is an evidenced non-mutating validation/dry-run or developer-authorized known target; otherwise do not run it.
+8. **No future-proofing.** Do not add code for hypothetical requirements. Three similar lines is better than a premature abstraction.
+9. **A new test must be seen to fail before it is trusted.** Before relying on a new behavioral test as green, confirm it actually goes red when the behavior is broken — write it before the fix (bug fixes), or briefly break the code under test and watch it fail for the right reason. Where running the red is impractical, state the specific defect the test would catch. *Why: AI-generated tests are the highest-risk for tautological or over-mocked assertions that pass even against broken code; a test you have watched fail cannot be vacuous.*
+10. **Derive, don't assume.** Before applying or recommending any technology-specific rule or recipe (ORM/data access, validation, HTTP client, test framework, state management), verify that technology is present in this repo via a package reference, import, or config. If a default or skill assumes an absent technology, say so explicitly and derive the convention from what the codebase actually uses instead.
+11. **Read the repository's own description of a subsystem before writing against it.** Before writing code that depends on a database schema, warehouse, integration, or shared library, check `docs/` for a file describing it and read that file first. What the repository records about its own structure outranks what you infer from names. If it is absent, stale, or silent on what you need, say so instead of inferring.
+
+---
+
+## Leanness
+
+The Boy Scout Rule biases toward improvements. This counterweight requires every change also consider what to remove or not introduce. Bloat is not style — it is AI-assisted development's highest-cost long-term failure mode.
+
+### Defaults
+
+1. **Place code by responsibility, not proximity.** Edit changed behaviour where it lives. New code joins an existing class only if that class's name still describes it (a repository or client: operations on its resource, nothing more); otherwise it gets its own class, composed the way the project already composes services, even with one consumer — never bolted onto the nearest class, never a subclass of one. Need another class's private logic? Extract it for both to share; add to that class only if the developer declines.
+2. **Project evidence selects service seams; data gets none.** For an injected service, use an interface only when the project's evidenced boundary or correctness need requires one; do not introduce one merely from this framework. Data carriers (DTOs, entities, value objects, `@ConfigurationProperties` records) never get interfaces, and don't invent abstractions for hypothetical variation.
+3. **No abstract base class with one subclass.** Inline it.
+4. **Wrappers must add behavior.** A method that just delegates is a layer that costs reading time and adds no value. Inline or remove.
+5. **No defensive code for impossible states.** Trust internal callers; validate only at system boundaries (HTTP request body, message bus payload, third-party API response). **Financial domain exception**: identify the applicable invariant, tolerance, and preconditions from policy and evidence; preserve demonstrated amount-sign, duplicate-effect, precision, and temporal controls. A numeric type or every-layer guard alone is not a verdict; require a policy violation or unsafe outcome demonstrated by source, interleaving, or executable/domain evidence, otherwise retain uncertainty.
+6. **No `try/catch` to silence; only to handle.** If you cannot say what the catch block does for the user, do not write it.
+7. **No comments that restate code.** A comment earns its place only when it captures a non-obvious *why* (constraint, invariant, workaround). Javadoc comments on public APIs are an exception when the project ships them. Bad: `// loop over orders` above `for (Order o : orders)`. Good: `// vendor API caps batches at 50` above a chunk-size constant.
+8. **No new generic helpers / utility classes without two existing call sites.** Three similar lines beat a premature abstraction.
+9. **Deletion is a contribution.** If a change makes existing code obsolete, delete it in the same PR. Comment-out is never the answer; that is what version control is for.
+10. **No re-exports through barrel files unless the barrel already exports adjacent symbols.** Do not grow the public surface for free.
+
+### Test leanness
+
+11. **Do not test getters, setters, or trivial constructors.** Test behavior, not assignment.
+12. **Do not test the framework.** No tests that DI resolves, that JPA/Hibernate can read its own writes, that Spring MVC request binding parses an int.
+13. **Reuse existing builders / fixtures.** Do not introduce parallel test data unless the existing builders cannot represent the case.
+14. **No over-mocking.** Mock only true external boundaries — network, clock, filesystem, third-party SDKs, the database when an in-memory substitute won't do. Never mock the type under test or its owned collaborators when a real or in-memory instance is cheap; prefer a fake/in-memory over an interaction mock for code you own. *Why: AI assistants frequently produce tests that assert on mock interactions and would still pass if the real code were broken — see [Verification Rules](#verification-rules) #9.*
+15. **No tautological assertions.** A test whose only assertion is `assertTrue(true)`, a not-null check on a freshly-constructed object, or "the mock was called" verifies nothing. Assert the observable return value, state change, or emitted effect. *Why: a large share of LLM-generated assertions are weak or vacuous — they bank coverage without catching regressions.*
+16. **Assert behavior, not implementation.** Do not assert private state, internal call order that isn't part of the contract, or exact log strings. A refactor that preserves behavior must not break the test.
+
+### When you must add structure
+
+If a change genuinely requires a new abstraction, helper, or wrapper, state the second consumer (existing or imminent) in the design or PR description. "Imminent" means within the same change-set. Otherwise: defer the abstraction until the second case appears.
+
+---
+
+## SOLID
+
+SOLID is **mandatory** in this codebase. It governs structure; [Leanness](#leanness) governs ceremony *beyond* that structure — the two are reconciled here and in Leanness #2.
+
+1. **Single Responsibility** — one reason to change per class. No god classes; keep controllers thin and delegate at an evidenced project boundary. Split a class that mixes orchestration, data access, and presentation. Heuristic: more than ~5 injected collaborators, or a name needing "And"/"Manager", means split.
+2. **Open/Closed** — extend by adding a type behind a seam, not by editing a stable class or subclassing a concrete service. When a `switch`/`if` over a type/enum code reaches its **third** arm, replace it with polymorphism. (Do not build the seam speculatively before then — that is future-proofing.)
+3. **Liskov Substitution** — every implementation fulfils its interface's contract completely: no `UnsupportedOperationException`, no strengthened preconditions, no weakened postconditions. If a type can't honour the contract, it must not implement it.
+4. **Interface Segregation** — small, role-based interfaces over one fat `*Service` interface. No implementation is forced to implement members it does not use.
+5. **Dependency Inversion** — derive an injected service's seam and registration from the project's evidenced architecture and correctness needs; do not require an interface or DI container solely from this framework. Preserve an evidenced dependency boundary; data carriers (DTOs, entities, value objects, `@ConfigurationProperties` records, enums) get no interface.
+
+**Mechanism**: when project evidence selects a Java service seam, follow its established composition root, bean scope, and interface/concrete shape; this framework selects none of them.
+
+**Deterministic backstop**: `solid-check` is advisory. ArchUnit is scaffoldable and enforces direction only after the consumer wires it into CI with `enforce-architecture`.
+
+---
+
+## Agentic Workflow
+
+When given any task, follow this execution model:
+
+### 1. Classify the intent — and run that workflow without being asked
+Natural-language requests trigger a workflow: classify silently, announce it in one line, and apply its rails. Ask if two fit; answer pure questions directly. Compound requests retain non-negotiables.
+
+> These rails are canonical and binding. Commands and `route-prompt` may elaborate, not contradict.
+
+- **Feature** — *add / implement / create / build new …*: design affected boundaries, failure modes, and the smallest useful tests when a harness exists; never add one incidentally → implement in evidenced subtasks → apply Verification command discovery → Boy Scout touched files → self-review → report delivery and validation. Preserve a project-evidenced service seam; otherwise add no interface/abstraction without a second consumer or correctness need.
+- **Bug fix** — *broken / bug / crash / failing / "not working" / "looks off"*: state root cause → with an applicable harness, first write a regression test that fails correctly; otherwise use the strongest evidenced validation, report tests **not available**, and add no foreign harness → make an outcome-bound fix → apply Verification command discovery → report cause, fix, validation, and radius.
+- **Refactor** — *cleanup / extract / rename / simplify / restructure*: establish an evidenced green baseline; add characterization coverage only to an existing applicable harness, otherwise report tests **not available** → refactor incrementally with verification → Boy Scout touched files → prove unchanged behavior → report before/after and net LOC.
+- **Test** — *write / add tests, increase coverage*: match the existing harness → cover the principal behavior plus consequential risks only → assert observable behavior, not internals or mock trivia → see each new behavioral test fail correctly → apply Verification command discovery → report coverage and gaps.
+- **Investigation / design** — *design X / approach for / trade-offs / "how should I"*: **write no code** → understand the requirement → analyse impact → weigh at least two approaches with pros/cons + effort → recommend with specifics → surface open questions before implementation.
+- **Debt cleanup** — *tech debt / cleanup debt*: confirm relevant `TECH_DEBT.md` items still exist and respect dismissed proposals unless materially changed evidence is named → apply Verification command discovery; without a harness, use the strongest evidenced check rather than adding one → recommend fix-now vs defer → update the file after fixes → report outcomes, validation, and diff.
+
+**Scoped repository knowledge.** For a non-trivial change—including an ordinary feature/fix naming neither a skill nor path—locate task areas; select relevant scoped wiki, map, skill, or example entries; exclude irrelevant/nonapplicable ones; read bodies/references on demand. Investigate conflicting applicable claims and recheck decisive correctness-material evidence. Ask, or retain unresolved, only correctness-material gaps from unresolved drafts, opposing scopes, or stale, missing, or inaccessible evidence; never infer them. Name material evidence and run repository-evidenced verification. Do not preload the wiki or depend on a hook.
+
+**Security-sensitive surfaces always get a security pass.** If the work touches authentication/authorization, payments, balances, ledgers, transactions, idempotency, or secrets, run `/security-review` on the diff (or the `security-auditor` agent) before presenting it as complete — regardless of which workflow above applies. The rule holds whether or not a hook reminder appears.
+
+### 2. Plan before coding — present, clarify, then get the go-ahead
+For any non-trivial task, STOP before writing code and post a short plan:
+- The files you'll create or modify, and the order of operations
+- Evidenced validation; include tests only when a harness exists
+- Your assumptions, plus **clarifying questions** for anything underspecified (ambiguous scope, unclear acceptance criteria, competing approaches). Do not guess past a material ambiguity to seem helpful — ask.
+- For larger features, persist the plan as a spec to `specs/<slug>.md` (see `/design`) and implement against it
+
+Then **wait for the developer's explicit go-ahead before editing code.** This catches wrong assumptions before wrong diffs and keeps the developer engaged rather than rubber-stamping. Skip only a trivial, unambiguous change (typo, one-liner), and say why.
+
+### 3. Execute in verified subtasks
+For features and complex changes, decompose into ordered subtasks:
+Choose only evidenced boundaries. A Java application may flow model → service → API → integration;
+another repository follows its documented structure. Omit absent layers and tests.
+
+Each subtask leaves applicable evidenced verification green; never add a foreign harness to manufacture a check.
+Apply Verification command discovery after each subtask; run only exact recorded invocations and fix their failures before continuing.
+
+### 4. Bug-fix scope
+Every bug-fix edit must be necessary for requested behaviour, existing caller/extension compatibility, or meaningful verification. Requested cleanup/refactoring is allowed; a touched file alone authorizes neither unrelated cleanup/logging nor a TODO. Necessary fixes may cross hunks. For changed public/protected signatures or virtual/override behaviour, identify any unrequested incompatibility; explicitly requested additions or breaks remain valid.
+
+### 5. Self-review before presenting
+Before presenting work as complete:
+- Review your changes against `AGENTS.md > Conventions`
+- Apply Verification command discovery; report what ran, was unavailable, or stayed manual/CI-only
+- Check if the change introduces a new pattern → flag that AGENTS.md needs updating
+- Check if the change resolves a TECH_DEBT.md item → flag for removal
+- Check if the change contradicts any convention → ask whether to update the convention or change the implementation
+- If the session surfaced a team-worthy gotcha, recipe, or failed approach, offer `remember-for-team`
+- **Close with a Verification & confidence line**: separate what you actually verified by running it (build / tests / lint — name which you ran) from what you assert without having run it, and flag anything you could not verify. Show the evidence — the command you ran and its observed result (e.g. an evidenced `./mvnw -B test` → Tests run: 142, Failures: 0, Errors: 0), not the bare claim "tests pass." This calibration is deliberate — it counters the well-documented tendency to feel more done than the work is.
+
+### 6. Reconcile affected artifacts
+Before finishing, inspect task effects on repository truth. Update affected writable canonical artifacts; regenerate derivatives from source. Follow their ownership, evidence, history, and security rules; never infer human intent. An affected artifact unreadable or unsafe to update is a blocker, not `none`. End with `Affected artifacts: none`, reconciled artifacts, or unresolved blockers.
+
+---

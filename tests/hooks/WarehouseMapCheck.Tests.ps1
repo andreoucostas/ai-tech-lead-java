@@ -1,0 +1,18 @@
+﻿if (-not (Get-Command Invoke-Hook -ErrorAction SilentlyContinue)) { . (Join-Path $PSScriptRoot '_HookHarness.ps1') }
+$scripts=(Resolve-Path (Join-Path $PSScriptRoot '..\..\scripts')).Path
+$ps=Join-Path $scripts 'warehouse-map-check.ps1'
+function Put($p,$t){$d=Split-Path -Parent $p;if($d){New-Item -ItemType Directory -Force $d|Out-Null};[IO.File]::WriteAllText($p,$t,[Text.UTF8Encoding]::new($false))}
+function Fixture([bool]$Warehouse=$true){$r=Join-Path ([IO.Path]::GetTempPath()) ('warehouse-map-'+[guid]::NewGuid());New-Item -ItemType Directory -Force $r|Out-Null;if($Warehouse){Put (Join-Path $r 'warehouse/DimCustomer.sql') 'CREATE TABLE dw.DimCustomer (CustomerKey int, EffectiveFrom date, IsCurrent bit);';Put (Join-Path $r 'warehouse/usp_LoadCustomer.sql') 'CREATE PROC etl.usp_LoadCustomer @BatchId int AS SELECT 1;'};$r}
+function Check($r,$exit,$text){$p=RunArg $ps $r;Assert ($p.Exit-eq$exit) "ps exit $($p.Exit): $($p.Out)";Assert ($p.Out-match$text) "ps missing $text`: $($p.Out)"}
+Reset-Tests
+It 'non-warehouse and excluded generated/vendor signals are not applicable' {$r=Fixture $false;try{Put (Join-Path $r 'VENDOR/warehouse/DimDecoy.sql') 'CREATE TABLE dw.DimDecoy (IsCurrent bit);';Put (Join-Path $r 'BUILD/warehouse/usp_LoadDecoy.sql') 'CREATE PROC etl.usp_LoadDecoy @BatchId int AS SELECT 1;';Check $r 0 'not-applicable';$missing=Join-Path $r 'missing-root';$p=RunArg $ps $missing;Assert ($p.Exit-eq 2) "PowerShell missing root exit=$($p.Exit)"}finally{Remove-Item -Recurse -Force $r}}
+It 'warehouse without map fails' {$r=Fixture;try{Check $r 1 'missing';New-Item -ItemType Directory -Force (Join-Path $r 'docs/warehouse-map.md')|Out-Null;Check $r 1 'missing'}finally{Remove-Item -Recurse -Force $r}}
+It 'current and stale maps are distinguished without unrelated JSON false positives' {$r=Fixture;try{Start-Sleep -Milliseconds 1100;Put (Join-Path $r 'docs/warehouse-map.md') '# map';Check $r 0 'current';Start-Sleep -Milliseconds 1100;Put (Join-Path $r 'package.json') '{"version":"2"}';Check $r 0 'current';Put (Join-Path $r 'warehouse/FactSale.sql') 'CREATE TABLE dw.FactSale (BatchId int);';Check $r 1 'stale'
+    $probe=Join-Path $r 'probe';New-Item -ItemType Directory -Force $probe|Out-Null
+    Copy-Item -LiteralPath (Join-Path $scripts 'warehouse-signals.tsv') -Destination $probe
+    $probePs=Join-Path $probe 'warehouse-map-check.ps1';$psText=[IO.File]::ReadAllText($ps);$psBroken=$psText.Replace('try { $matched = $file.Name -match $parts[1] -or (Select-String -LiteralPath $file.FullName -Pattern $parts[1] -Quiet -ErrorAction Stop) }',"try { throw 'simulated read failure' }");Assert ($psBroken-ne$psText) 'PowerShell read-failure mutation missed';Put $probePs $psBroken
+    $p=RunArg $probePs $r;$pText=$p.Out+"`n"+$p.Err;Assert ($p.Exit-eq 2-and$pText-match'Could not read warehouse artifact') "PowerShell artifact read failure was not explicit: exit=$($p.Exit) $pText"
+    Copy-Item -LiteralPath $ps -Destination $probePs -Force;Put (Join-Path $probe 'warehouse-signals.tsv') "broken-only-one-field`n"
+    $p=RunArg $probePs $r;Assert($p.Exit-eq2)"PowerShell malformed signal exit=$($p.Exit)"
+}finally{Remove-Item -Recurse -Force $r}}
+exit (Write-TestSummary 'WarehouseMapCheck.Tests')

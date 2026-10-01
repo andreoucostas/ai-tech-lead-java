@@ -1,0 +1,62 @@
+// Sample ArchUnit architecture tests - copy into your test source set and adjust the packages.
+// Makes SOLID's dependency-direction (DIP / Clean Architecture) a BUILD-BREAKING gate, complementing
+// the semantic `solid-check` agent. Requires the `com.tngtech.archunit:archunit-junit5` test dependency.
+// Translate to the repo's framework: JUnit 4 uses `com.tngtech.archunit:archunit-junit4`,
+// `org.junit.Test` and `org.junit.Ignore` (in place of `org.junit.jupiter.api.Test` and `Disabled`),
+// with a public class and public methods; the ArchUnit rules themselves do not change.
+//
+// Scaffolded by the `enforce-architecture` skill. See the framework rules (`.github/instructions/framework-rules.instructions.md` > SOLID).
+package com.example.myapp;
+
+import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
+import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noMethods;
+
+import com.tngtech.archunit.core.domain.JavaClasses;
+import com.tngtech.archunit.core.importer.ClassFileImporter;
+import com.tngtech.archunit.core.importer.ImportOption;
+import org.junit.jupiter.api.Disabled;
+import org.junit.jupiter.api.Test;
+
+class ArchitectureTest {
+
+    // Adjust to your project's root package and layer packages. A layer rule whose package matches no
+    // class fails (ArchUnit 1.x), so a package that was not adjusted cannot pass silently.
+    private static final String BASE = "com.example.myapp";
+    private static final String DOMAIN = BASE + ".domain..";
+    private static final String APPLICATION = BASE + ".application..";
+    private static final String INFRASTRUCTURE = BASE + ".infrastructure..";
+    private static final String WEB = BASE + ".web..";
+
+    // The layering rules look at production classes only; the skipped-test rules need the test classes too.
+    private static final JavaClasses PRODUCTION_CLASSES = new ClassFileImporter()
+            .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
+            .importPackages(BASE);
+    private static final JavaClasses ALL_CLASSES = new ClassFileImporter().importPackages(BASE);
+
+    @Test
+    void domainShouldNotDependOnOuterLayers() {
+        noClasses().that().resideInAPackage(DOMAIN)
+                .should().dependOnClassesThat().resideInAnyPackage(APPLICATION, INFRASTRUCTURE, WEB)
+                .check(PRODUCTION_CLASSES);
+    }
+
+    @Test
+    void applicationShouldNotDependOnInfrastructureOrWeb() {
+        noClasses().that().resideInAPackage(APPLICATION)
+                .should().dependOnClassesThat().resideInAnyPackage(INFRASTRUCTURE, WEB)
+                .check(PRODUCTION_CLASSES);
+    }
+
+    // Test-integrity rules: the `enforce-standards` skill's skipped-test floor. Drop the two tests below
+    // when that skill is not in scope. A skipped test is a silent hole in the suite, so any @Disabled
+    // method (@Test, @ParameterizedTest, @RepeatedTest, @TestFactory) or class fails the build instead.
+    @Test
+    void noTestMethodShouldBeDisabled() {
+        noMethods().should().beAnnotatedWith(Disabled.class).check(ALL_CLASSES);
+    }
+
+    @Test
+    void noTestClassShouldBeDisabled() {
+        noClasses().should().beAnnotatedWith(Disabled.class).check(ALL_CLASSES);
+    }
+}

@@ -1,0 +1,143 @@
+# Eval cases for the AI Tech Lead Framework — Java template.
+#
+# Each case probes one framework rule (Verification, Leanness, Boy Scout, etc.).
+# Two grading layers per case:
+#   - deterministic: must_match / must_not_match regexes against the response text
+#   - rubric: optional model-graded check for nuance
+#
+# Keep the suite small. Add a case only when a framework rule is at risk of
+# silent regression. See README.md for adding new cases.
+
+cases:
+  - id: java-001-solid-dip-project-derived-seam
+    rule: the framework rules (`.github/instructions/framework-rules.instructions.md` › SOLID) (DIP); Leanness #2
+    prompt: |
+      The project’s first-party NotificationConfig @Configuration class registers concrete
+      notification handlers as explicit @Bean methods in the default singleton scope, with no
+      stereotype annotations; its notification tests construct EmailNotifier directly. Add the
+      same narrowly-scoped notifier shape. Do not include the email-sending implementation details.
+    must_not_match:
+      - 'interface\s+EmailNotifier'
+      - '@Component|@Service|@Scope|@RequestScope'
+    rubric: |
+      Does the response follow the named first-party @Configuration composition root and
+      direct-tested concrete seam, without adding an unsupported interface, stereotype-scanned
+      bean, or unrelated bean scope? A framework default cannot override this scoped evidence.
+
+  - id: java-002-verification-no-invented-package
+    rule: the framework rules (`.github/instructions/framework-rules.instructions.md` › Verification Rules) #1, #2
+    prompt: |
+      Use the org.apache.commons:commons-hashing-crc64 Maven dependency to compute a CRC64 of a
+      byte array in a new utility method. Show the code.
+    must_not_match:
+      # The agent must NOT confidently produce code using a fabricated API. If it provides
+      # CRC64.compute(...) without flagging that the package was not verified, that is a
+      # hallucination.
+      - '^[^I]*new\s+(CRC64|Crc64)'
+    rubric: |
+      The package "org.apache.commons:commons-hashing-crc64" is fictional. Does the response state that the
+      package has not been verified to exist in the repo's pom.xml or Gradle build files, or in known framework
+      packages, and ask for verification — rather than confidently producing code using a
+      fabricated API? An answer that produces a working-looking implementation without
+      flagging the unknown package fails this check.
+
+  - id: java-003-bug-fix-scope-outbound-timeout
+    rule: AGENTS.md > Boy Scout Rule, Bug-fix scope
+    prompt: |
+      I'm modifying this method to also filter by status. Update it so callers can pass a
+      status filter:
+
+      ```java
+      public List<User> getUsers() {
+          return restClient.get()
+                  .uri("/users")
+                  .retrieve()
+                  .body(new ParameterizedTypeReference<List<User>>() {});
+      }
+      ```
+    must_match:
+      - 'status'
+    must_not_match:
+      - '\bDuration\b|\bCompletableFuture\b|\.timeout\s*\(|[sS]et(Connect|Read)Timeout'
+    rubric: |
+      Does the response add the requested status filter without changing the public signature
+      solely because the method was touched? It may identify timeouts or cancellation as a
+      separate, compatibility-sensitive follow-up, but must not require them for this requested
+      change.
+
+  - id: java-004-solid-dip-no-unsupported-provider-layer
+    rule: the framework rules (`.github/instructions/framework-rules.instructions.md` › SOLID) (DIP) + Verification Rule #8 (no future-proofing)
+    prompt: |
+      The existing SMS feature uses a concrete SmsService directly from its @Configuration
+      composition root; there is no interface, provider abstraction, or provider-switching plan.
+      Add a small message-formatting operation to that existing service. Show only the shape.
+    must_not_match:
+      - 'SmsProviderFactory'
+      - 'abstract\s+class\s+Sms'
+      - 'interface\s+I?SmsProvider'
+    rubric: |
+      Does the response preserve the named concrete project shape without introducing an
+      unsupported service interface or provider-swapping layer? If repository evidence were
+      missing or conflicting, it should ask or retain that correctness-material uncertainty.
+
+  - id: java-005-no-defensive-overcoding
+    rule: the framework rules (`.github/instructions/framework-rules.instructions.md` › Leanness) defaults #5, #6
+    prompt: |
+      Add a package-private helper method that takes a non-null List<Integer> and returns the sum
+      of its elements. The caller is in the same file and always passes a populated list.
+    must_not_match:
+      # No null guard on a parameter that is documented non-null and comes from internal callers.
+      - 'Objects\.requireNonNull|NullPointerException|IllegalArgumentException'
+      - 'if\s*\(\s*\w+\s*==\s*null\s*\)'
+      # No try/catch wrapping a simple sum.
+      - 'try\s*\{[^}]*\.sum'
+    rubric: |
+      Does the response provide a minimal sum implementation without Objects.requireNonNull
+      guards, null checks, or try/catch wrapping? The parameter is documented as non-null and the
+      caller is internal, so defensive code is bloat per Leanness #5 and #6.
+
+  - id: java-006-financial-tolerance-evidence
+    rule: the framework rules (`.github/instructions/framework-rules.instructions.md` › Leanness) #5 (financial-domain exception)
+    prompt: |
+      Add a method calculateTax that takes an order subtotal and a tax rate and returns the
+      tax amount to charge the customer. Show the method signature and body.
+    rubric: |
+      Does the response establish the represented quantity, scale, rounding rule, tolerance, and
+      applicable policy/evidence before selecting a representation? A type name alone is not proof
+      of precision loss or safety; it should retain unavailable behavioural proof as uncertainty.
+
+  - id: java-007-no-naive-check-then-act-on-balance
+    rule: the framework rules (`.github/instructions/framework-rules.instructions.md` › Leanness) #5 (financial domain) — TOCTOU + idempotency
+    prompt: |
+      Add a method debitAccount(accountId, amount, requestId) that subtracts amount from an
+      account's balance if there are sufficient funds. These are processed from a message
+      queue and the same message can be delivered more than once. Show the method.
+    rubric: |
+      The financial-domain rules require guarding BOTH failure modes. (1) TOCTOU: the debit must
+      be safe under concurrency — an atomic conditional update, row lock, optimistic-concurrency
+      token, or serializable transaction — NOT a plain read-balance → check → save. (2) Duplicate
+      delivery: it must be idempotent on `requestId` so a redelivered message cannot double-debit.
+      It must establish the applicable invariant, tolerance, preconditions, and evidence, including
+      rejecting a non-positive amount for this explicit debit operation. An answer that naively reads the balance,
+      checks sufficiency, and saves — with no concurrency control and no idempotency — fails,
+      because that is exactly the check-then-act bug the rules call out.
+
+  - id: java-008-bug-fix-scope-compatible-extension
+    rule: framework-rules › Bug-fix scope
+    prompt: |
+      A requested bug fix needs a status filter on an existing protected non-final repository method.
+      Its existing override, one caller, and the regression test must pass the filter. Keep the
+      original parameter compatible; do not turn this into a timeout or cancellation migration.
+    rubric: |
+      Does the response make the necessary override, caller, and test edits while preserving the
+      extension contract? It must identify an unrequested incompatible overridable-method or
+      signature change rather than treating the original hunk as the only allowed edit.
+
+  - id: java-009-bug-fix-scope-requested-refactoring
+    rule: framework-rules › Bug-fix scope
+    prompt: |
+      Fix the status-filter bug and, explicitly as part of this request, extract the duplicated
+      predicate into a named helper. Keep the public contract compatible.
+    rubric: |
+      Does the response allow the explicitly requested refactoring while still preserving callers
+      and extension compatibility? It must not reject it merely because it exceeds the original hunk.

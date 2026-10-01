@@ -1,0 +1,5 @@
+# AI-assisted development local telemetry
+# Format: ISO-8601-UTC TAB git-branch TAB file-path
+# Appended for supported editor/file-write events when the audit-trail hook runs.
+# Mutable and incomplete; shell/external writes and unavailable hooks are blind spots.
+# Keep local and out of version control. This is not correctness or compliance evidence.

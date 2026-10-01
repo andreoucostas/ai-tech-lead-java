@@ -1,0 +1,33 @@
+name: Docs sync check
+
+# GitHub Actions wrapper for the supported Windows execution surface. The same PowerShell check can
+# be wired into a self-hosted Windows Bamboo or Jenkins agent; see docs/ci-integration.md.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  docs-sync-check:
+    name: docs-sync-check
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v5
+      - name: Assert direct PowerShell 7 host
+        run: |
+          $hostPath = (Get-Process -Id $PID).Path
+          $hostLeaf = [IO.Path]::GetFileName($hostPath)
+          if ($PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion.Major -lt 7 -or $hostLeaf -notmatch '^pwsh(?:\.exe)?$') {
+            throw "Expected direct PowerShell 7 (pwsh); observed $hostLeaf $($PSVersionTable.PSEdition) $($PSVersionTable.PSVersion)."
+          }
+      - name: AI Tech Lead framework state
+        run: |
+          $hostPath = (Get-Process -Id $PID).Path
+          & $hostPath -NoProfile -File scripts/docs-sync-check.ps1
+          exit $LASTEXITCODE

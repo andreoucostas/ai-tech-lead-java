@@ -1,0 +1,2 @@
+# PowerShell runs fine with either ending; pin LF too for clean, churn-free diffs across OSes.
+*.ps1 text eol=lf

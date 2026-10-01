@@ -1,0 +1,6 @@
+# Hook state — runtime stamps used for throttling and dedup.
+.state/
+# Mutable local hook telemetry (existing tracked copies need explicit untracking).
+ai-audit.log
+# Claude Code's per-developer settings: permissions and env values that may hold keys.
+settings.local.json

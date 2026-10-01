@@ -1,0 +1,1766 @@
+﻿# Install the AI Tech Lead Framework into a target repository.
+# Usage: pwsh -NoProfile -File scripts/install.ps1 [-AllowDirtyTree] [-WhatIf] [-AllowDowngrade] [-AllowOutdated] C:\path\to\target-repo
+#
+# Before it changes anything, it asks the remote of the framework clone it runs from whether that
+# clone is out of date: a newer vX.Y.Z release tag than this copy's version, or an upstream branch this
+# checkout is behind, stops the install (exit 4) unless -AllowOutdated is passed. A copy that cannot be
+# checked (no Git, not a tracked clone, no answer within 10 seconds) installs with a NOTE saying so;
+# ATL_SOURCE_CHECK=off skips the check and says that instead.
+#
+# Copies the template's framework files into the target, EXCLUDING the .git directory, the
+# .template-repo marker (which would disable the consumer's CI guardrail), the template repo's own
+# meta files (README.md, CHANGELOG.md, .gitignore, .gitattributes), and the installer itself.
+#
+# Three modes, detected automatically:
+#   greenfield — target has no AI tooling and no shipped path holding other bytes: plain copy;
+#                next step is /bootstrap.
+#   brownfield — target already has AI tooling (CLAUDE.md, .cursorrules, Copilot instructions,
+#                ADRs, ...) or a shipped path holding other bytes (tracked, untracked, ignored or
+#                outside Git): the originals this copy would overwrite are moved to docs/pre-adoption/
+#                first, and .claude/adoption-pending.json is written so every later session (and CI)
+#                steers to /adopt. Next step is /adopt.
+#   update     — target already carries .claude/framework-version.json. Consumer-owned protected
+#                paths are restored; framework-owned machinery is overwritten; mixed-ownership
+#                .claude/settings.json is backed up, refreshed, and adapted to the host. An older
+#                instruction layout (project text in CLAUDE.md) is moved once into AGENTS.md.
+param(
+    [Parameter(Mandatory = $true)][string]$Target,
+    [switch]$AllowDirtyTree,
+    [switch]$WhatIf,
+    [switch]$AllowDowngrade,
+    [switch]$AllowOutdated
+)
+$ErrorActionPreference = 'Stop'
+$followUpPowerShell = if ($PSVersionTable.PSVersion.Major -ge 7) {
+    'pwsh -NoProfile -File'
+} else {
+    'powershell.exe -NoProfile -ExecutionPolicy Bypass -File'
+}
+$pwshAvailable = $PSVersionTable.PSVersion.Major -ge 7 -or
+    $null -ne (Get-Command pwsh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1)
+
+if (-not (Test-Path -LiteralPath $Target -PathType Container)) { Write-Error "Target '$Target' is not a directory."; exit 2 }
+
+# -LiteralPath: read as a wildcard, 'repo[a]' resolves a sibling 'repoa' and the install lands there.
+$src = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
+$tgt = (Resolve-Path -LiteralPath $Target).Path
+if ($tgt -eq $src) { Write-Error "Target is the template repo itself — choose a different target."; exit 2 }
+# Brownfield archive paths must never traverse a reparse point. Resolving a target path is not
+# enough: a junction/symlink below it can redirect either the collision source or the archive
+# destination outside the consumer repository before Move-Item gets a chance to report anything.
+function Get-ReparsePointAncestor {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $current = $Path
+    while ($true) {
+        # Get-Item -Force sees a dangling link where Test-Path reports false. Do not replace this
+        # with a Test-Path guard: that was the route by which a broken link escaped preflight.
+        $item = Get-Item -Force -LiteralPath $current -ErrorAction SilentlyContinue
+        if ($item -and (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { return $current }
+        if ($current -eq $tgt) { return $null }
+        $parent = Split-Path -Parent $current
+        if (-not $parent -or $parent -eq $current) { return $null }
+        $current = $parent
+    }
+}
+
+# Windows PowerShell 5.1 returns nothing, instead of throwing ItemNotFound, for a missing path under a
+# directory whose name holds brackets; each absence check below then read the gap as an entry and
+# reported a phantom path. Throw the same error on both hosts; any other failure still escapes.
+function Get-LiteralItem {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $item = Get-Item -Force -LiteralPath $Path -ErrorAction Stop
+    if ($null -eq $item) { throw [Management.Automation.ItemNotFoundException]::new("Cannot find path '$Path' because it does not exist.") }
+    return $item
+}
+
+# SHA-256 of the raw bytes with every CR LF pair turned into LF. Git for Windows checks text out with
+# CRLF (core.autocrlf=true) while the retirement ledger records released LF blobs, so a retired file
+# differing only in line endings holds no consumer content. Mixed endings pass for the same reason; a
+# BOM, an edited line or a lone CR does not. Latin-1 maps every byte to one char and back unchanged.
+function Get-LfSha256 {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]]$Bytes)
+    $latin1 = [Text.Encoding]::GetEncoding(28591)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($latin1.GetBytes($latin1.GetString($Bytes).Replace("`r`n", "`n"))))).Replace('-', '').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+}
+
+function Get-ContainedTargetPath {
+    param([Parameter(Mandatory = $true)][string]$Relative)
+    if ([string]::IsNullOrWhiteSpace($Relative) -or $Relative.Contains('\') -or $Relative.Contains([char]0) -or
+        $Relative.StartsWith('/') -or $Relative.StartsWith('//') -or $Relative -match '^[A-Za-z]:' ) {
+        throw "unsafe or non-normalized path '$Relative'"
+    }
+    foreach ($segment in $Relative.Split('/')) {
+        if ([string]::IsNullOrEmpty($segment) -or $segment -eq '.' -or $segment -eq '..') {
+            throw "unsafe or non-normalized path '$Relative'"
+        }
+    }
+    $full = [IO.Path]::GetFullPath((Join-Path $tgt ($Relative -replace '/', [IO.Path]::DirectorySeparatorChar)))
+    $prefix = $tgt.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    if (-not $full.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { throw "path escapes the target: '$Relative'" }
+    return $full
+}
+
+function Assert-SafeTargetMutation {
+    param([Parameter(Mandatory = $true)][string]$Relative, [switch]$AllowTree)
+    $destination = Get-ContainedTargetPath -Relative $Relative
+    $reparse = Get-ReparsePointAncestor -Path $destination
+    if ($reparse) {
+        [Console]::Error.WriteLine("ERROR: Refusing install mutation '$Relative': target path traverses reparse/symlink '$reparse'. Remove the link, then re-run.")
+        exit 3
+    }
+    $item = Get-Item -Force -LiteralPath $destination -ErrorAction SilentlyContinue
+    if ($item -and -not $AllowTree -and -not (Test-Path -LiteralPath $destination -PathType Leaf)) {
+        [Console]::Error.WriteLine("ERROR: Refusing install mutation '$Relative': existing target is not a regular file.")
+        exit 3
+    }
+    $parent = Split-Path -Parent $destination
+    while ($parent -and $parent.StartsWith($tgt, [StringComparison]::OrdinalIgnoreCase)) {
+        $parentItem = Get-Item -Force -LiteralPath $parent -ErrorAction SilentlyContinue
+        if ($parentItem -and -not (Test-Path -LiteralPath $parent -PathType Container)) {
+            [Console]::Error.WriteLine("ERROR: Refusing install mutation '$Relative': parent '$parent' is not a directory.")
+            exit 3
+        }
+        if ($parent -eq $tgt) { break }
+        $parent = Split-Path -Parent $parent
+    }
+    return $destination
+}
+
+function Read-OwnershipManifest {
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Label)
+    $document = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
+    if ([int]$document.'schema-version' -ne 1 -or $null -eq $document.paths) { throw "$Label has an unsupported or missing schema" }
+    $entries = @($document.paths)
+    if ($entries.Count -eq 0) { throw "$Label contains no paths" }
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    # Previous ownership is untrusted deletion authority. Keep duplicate rejection
+    # case-insensitive, but key lookups ordinal: `Scripts/X` must never authorize deleting
+    # canonical `scripts/x` on Windows' case-insensitive filesystem.
+    $byPath = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
+    foreach ($entry in $entries) {
+        $relative = [string]$entry.path
+        $ownership = [string]$entry.ownership
+        [void](Get-ContainedTargetPath -Relative $relative)
+        if (-not $seen.Add($relative)) { throw "$Label contains duplicate path '$relative'" }
+        if ($ownership -notin @('framework-owned/overwritten', 'consumer-owned/protected', 'mixed')) {
+            throw "$Label has unsupported ownership '$ownership' for '$relative'"
+        }
+        $byPath[$relative] = $ownership
+    }
+    return [pscustomobject]@{ Entries = $entries; ByPath = $byPath }
+}
+
+function Read-RetirementLedger {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $document = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
+    if ([int]$document.'schema-version' -ne 1 -or $null -eq $document.retirements) { throw 'retirement ledger has an unsupported or missing schema' }
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $byPath = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
+    foreach ($entry in @($document.retirements)) {
+        $relative = [string]$entry.path
+        $version = [string]$entry.'retired-in'
+        $hashes = @($entry.'known-content-sha256' | ForEach-Object { [string]$_ })
+        [void](Get-ContainedTargetPath -Relative $relative)
+        if (-not $seen.Add($relative)) { throw "retirement ledger contains duplicate path '$relative'" }
+        if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { throw "retirement ledger has invalid retired-in version '$version' for '$relative'" }
+        if ($hashes.Count -eq 0 -or @($hashes | Where-Object { $_ -cnotmatch '^[0-9a-f]{64}$' }).Count -gt 0 -or @($hashes | Select-Object -Unique).Count -ne $hashes.Count) {
+            throw "retirement ledger has invalid or duplicate known-content-sha256 values for '$relative'"
+        }
+        $byPath[$relative] = [pscustomobject]@{ Version = $version; Hashes = $hashes }
+    }
+    return $byPath
+}
+
+function Compare-ReleaseVersion {
+    param([string]$Left, [string]$Right)
+    if ($Left -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$' -or $Right -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+        throw "versions must use release SemVer form X.Y.Z (installed='$Left', incoming='$Right')"
+    }
+    $a = $Left.Split('.'); $b = $Right.Split('.')
+    for ($i = 0; $i -lt 3; $i++) {
+        $an = $a[$i].TrimStart('0'); if ($an.Length -eq 0) { $an = '0' }
+        $bn = $b[$i].TrimStart('0'); if ($bn.Length -eq 0) { $bn = '0' }
+        if ($an.Length -lt $bn.Length) { return -1 }
+        if ($an.Length -gt $bn.Length) { return 1 }
+        $cmp = [StringComparer]::Ordinal.Compare($an, $bn)
+        if ($cmp -lt 0) { return -1 }; if ($cmp -gt 0) { return 1 }
+    }
+    return 0
+}
+
+# One git command in the framework clone, bounded by the check's shared deadline so that no remote can
+# hold the install: stdin is closed, Git's own prompts are off (terminal, Git Credential Manager, askpass),
+# and at the deadline the process tree is killed, prompt or not. $null means git could not be run.
+function Invoke-SourceGit {
+    param([Parameter(Mandatory = $true)][string]$GitPath, [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)][datetime]$Deadline, [Parameter(Mandatory = $true)][string[]]$Arguments)
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $GitPath
+        # Windows command-line quoting: a quote is escaped, and backslashes before a quote or at the end (a
+        # drive-root clone, as a subst drive gives) are doubled, so no argument can split or run into another.
+        $psi.Arguments = ((@('-C', $Directory) + $Arguments | ForEach-Object { '"' + (($_ -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1') + '"' }) -join ' ')
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardInput = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+        $psi.EnvironmentVariables['GIT_TERMINAL_PROMPT'] = '0'
+        $psi.EnvironmentVariables['GCM_INTERACTIVE'] = 'never'
+        # Empty, not absent: git then also skips core.askPass and SSH_ASKPASS.
+        $psi.EnvironmentVariables['GIT_ASKPASS'] = ''
+        $psi.EnvironmentVariables['SSH_ASKPASS_REQUIRE'] = 'never'
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $proc.StandardInput.Close()
+        $stdout = $proc.StandardOutput.ReadToEndAsync()
+        $stderr = $proc.StandardError.ReadToEndAsync()
+    } catch { return $null }
+    # The stream reads share the deadline: a child git leaves behind can hold the pipes after git exits.
+    try {
+        $done = $proc.WaitForExit([int][Math]::Max(0, ($Deadline - [DateTime]::UtcNow).TotalMilliseconds)) -and
+            [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($stdout, $stderr),
+                [int][Math]::Max(0, ($Deadline - [DateTime]::UtcNow).TotalMilliseconds))
+    } catch { $done = $false }
+    if (-not $done) {
+        $ErrorActionPreference = 'Continue'
+        try { & taskkill.exe /T /F /PID $proc.Id *> $null } catch { }
+        try { if (-not $proc.HasExited) { $proc.Kill() } } catch { }
+        return [pscustomobject]@{ TimedOut = $true; ExitCode = $null; Output = '' }
+    }
+    return [pscustomobject]@{ TimedOut = $false; ExitCode = $proc.ExitCode; Output = $stdout.Result.Trim() }
+}
+
+# Is the framework clone this copy sits in out of date? A clone left behind installs an old release,
+# and nothing later says so. The remote is read with one ls-remote, no object is looked up that the
+# clone may lack (in a partial clone that fetches it), and the whole check has 10 seconds.
+# State is current, outdated, unchecked or skipped; only current is reported as checked.
+function Get-SourceFreshness {
+    $unchecked = { param([string]$Why) [pscustomobject]@{ State = 'unchecked'; Detail = $Why; Update = $null } }
+    if ($env:ATL_SOURCE_CHECK -eq 'off') { return [pscustomobject]@{ State = 'skipped'; Detail = 'not checked (ATL_SOURCE_CHECK=off)'; Update = $null } }
+    foreach ($name in @('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE')) {
+        if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($name, 'Process'))) { return & $unchecked "Git routing variable $name is set" }
+    }
+    $git = @(Get-Command git -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if ($git.Count -eq 0) { return & $unchecked 'Git was not found' }
+    $gitPath = [string]$git[0].Source
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    # Only a clone of the framework itself, whose root is this copy and tracks both the installer and the
+    # template marker: a copy inside another repository would otherwise be judged by that repository's
+    # tags and branches, and told to update that repository. --full-name keeps a nested copy's paths
+    # prefixed, so it never matches.
+    $tracked = Invoke-SourceGit -GitPath $gitPath -Directory $src -Deadline $deadline -Arguments @('ls-files', '--full-name', '--error-unmatch', '--',
+        'scripts/install.ps1', '.template-repo')
+    $top = Invoke-SourceGit -GitPath $gitPath -Directory $src -Deadline $deadline -Arguments @('rev-parse', '--show-toplevel')
+    $trackedPaths = if ($tracked -and -not $tracked.TimedOut -and $tracked.ExitCode -eq 0) { @($tracked.Output -split "`n" | ForEach-Object { $_.Trim() }) } else { @() }
+    if (-not ($trackedPaths -ccontains 'scripts/install.ps1') -or -not ($trackedPaths -ccontains '.template-repo') -or
+        -not $top -or $top.ExitCode -ne 0 -or -not $top.Output) {
+        return & $unchecked 'this copy is not the root of a Git clone of the framework'
+    }
+    # The clone as Git resolved it: a copy reached through a link or junction belongs to the clone it points into.
+    $clone = [IO.Path]::GetFullPath($top.Output)
+    $remote = 'origin'; $branch = $null
+    $head = Invoke-SourceGit -GitPath $gitPath -Directory $clone -Deadline $deadline -Arguments @('symbolic-ref', '--quiet', 'HEAD')
+    if ($head -and $head.ExitCode -eq 0 -and $head.Output -cmatch '^refs/heads/(.+)$') {
+        $local = $Matches[1]
+        $upstreamRemote = Invoke-SourceGit -GitPath $gitPath -Directory $clone -Deadline $deadline -Arguments @('config', '--get', "branch.$local.remote")
+        $upstreamBranch = Invoke-SourceGit -GitPath $gitPath -Directory $clone -Deadline $deadline -Arguments @('config', '--get', "branch.$local.merge")
+        # A remote name only: a URL configured here could carry a credential into the messages below.
+        if ($upstreamRemote -and $upstreamRemote.ExitCode -eq 0 -and $upstreamRemote.Output -match '^[\w.-]+$' -and $upstreamRemote.Output -ne '.' -and
+            $upstreamBranch -and $upstreamBranch.ExitCode -eq 0 -and $upstreamBranch.Output) {
+            $remote = $upstreamRemote.Output; $branch = $upstreamBranch.Output
+        }
+    }
+    $query = @('ls-remote', '--refs', $remote, 'refs/tags/v*')
+    if ($branch) { $query += $branch }
+    $listing = Invoke-SourceGit -GitPath $gitPath -Directory $clone -Deadline $deadline -Arguments $query
+    if (-not $listing) { return & $unchecked 'Git could not be run' }
+    if ($listing.TimedOut) { return & $unchecked "git ls-remote $remote did not finish within 10 seconds" }
+    if ($listing.ExitCode -ne 0) { return & $unchecked "git ls-remote $remote failed (exit $($listing.ExitCode))" }
+    $tips = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
+    foreach ($line in ($listing.Output -split "`n")) {
+        $fields = $line.Trim() -split "`t"
+        if ($fields.Count -eq 2) { $tips[$fields[1]] = $fields[0] }
+    }
+    $newest = $null
+    foreach ($ref in $tips.Keys) {
+        if ($ref -cmatch '^refs/tags/v([0-9]+\.[0-9]+\.[0-9]+)$') {
+            $release = $Matches[1]
+            if (-not $newest -or (Compare-ReleaseVersion -Left $release -Right $newest) -gt 0) { $newest = $release }
+        }
+    }
+    $stale = New-Object System.Collections.Generic.List[string]
+    $fresh = New-Object System.Collections.Generic.List[string]
+    $unknown = $null
+    $update = "git -C `"$clone`" fetch --tags $remote, then git -C `"$clone`" checkout v$newest"
+    if ($newest -and (Compare-ReleaseVersion -Left $newest -Right $incomingVersion) -gt 0) { $stale.Add("$remote has release v$newest and this copy is v$incomingVersion") }
+    elseif ($newest) { $fresh.Add("no release newer than v$incomingVersion") }
+    if ($branch -and $tips.ContainsKey($branch)) {
+        $tracking = "$remote/$($branch -replace '^refs/heads/', '')"
+        # The tip is looked up only when it is HEAD or the tip this clone last fetched: any other tip is new
+        # to the clone, and looking it up would make a partial clone fetch it.
+        $headTip = Invoke-SourceGit -GitPath $gitPath -Directory $clone -Deadline $deadline -Arguments @('rev-parse', '--verify', '--quiet', 'HEAD')
+        $fetched = Invoke-SourceGit -GitPath $gitPath -Directory $clone -Deadline $deadline -Arguments @('rev-parse', '--verify', '--quiet', '@{upstream}')
+        if (-not $headTip -or $headTip.TimedOut -or -not $fetched -or $fetched.TimedOut) { $unknown = "could not tell whether this checkout is behind $tracking" }
+        elseif ($headTip.ExitCode -eq 0 -and $headTip.Output -eq $tips[$branch]) { $fresh.Add("not behind $tracking") }
+        elseif ($fetched.ExitCode -ne 0 -or $fetched.Output -ne $tips[$branch]) {
+            $stale.Add("$tracking has commits this checkout has not fetched"); $update = "git -C `"$clone`" pull"
+        } else {
+            $count = Invoke-SourceGit -GitPath $gitPath -Directory $clone -Deadline $deadline -Arguments @('rev-list', '--count', "HEAD..$($tips[$branch])")
+            if (-not $count -or $count.ExitCode -ne 0 -or $count.Output -notmatch '^[0-9]+$') { $unknown = "could not tell whether this checkout is behind $tracking" }
+            elseif ([int]$count.Output -eq 0) { $fresh.Add("not behind $tracking") }
+            else { $stale.Add("this checkout is $($count.Output) commit$(if ([int]$count.Output -ne 1) { 's' }) behind $tracking"); $update = "git -C `"$clone`" pull" }
+        }
+    }
+    if ($stale.Count -gt 0) { return [pscustomobject]@{ State = 'outdated'; Detail = ($stale -join '; '); Update = $update } }
+    if ($unknown) { return & $unchecked $unknown }
+    if ($fresh.Count -eq 0) { return & $unchecked "$remote has no vX.Y.Z release tag, and this checkout tracks none of its branches" }
+    return [pscustomobject]@{ State = 'current'; Detail = "checked against ${remote}: $($fresh -join ', ')"; Update = $null }
+}
+# Template-repo meta files that must never land in (or overwrite their namesakes in) a consumer repo.
+$metaFiles = @('.git', '.template-repo', 'README.md', 'CHANGELOG.md', '.gitignore', '.gitattributes')
+# Composition reads this declarative set from the installer. It is intentionally explicit so
+# install.ps1 remains the single ownership-policy authority while a test can pin the complete set.
+$excludedFromInstall = @('.git', '.template-repo', 'README.md', 'CHANGELOG.md', '.gitignore', '.gitattributes',
+    'scripts/install.ps1', '.github/workflows/template-ci.yml')
+
+# Consumer files the copy below would otherwise clobber. Update skips them directly; brownfield
+# archives them unless the copy-if-absent policy below keeps the live path for in-place screening.
+$protected = @('CLAUDE.md', 'AGENTS.md', 'TECH_DEBT.md', 'SECURITY_FINDINGS.md', 'LEARNINGS.md',
+    'FRAMEWORK-CONTEXT.md', '.github/copilot-instructions.md', 'docs/ARCHITECTURE.md',
+    'docs/architecture-decisions.md', 'docs/wiki/INDEX.md', 'LICENSES/ai-tech-lead-MIT.txt')
+# Persistent state is copied only when absent. The composer reads this policy from both installer
+# PowerShell installer authority and emits it as consumer-owned/protected in framework-ownership.json.
+$persistentCopyIfAbsent = @(
+    '.claude/ai-audit.log'
+)
+# These are never bulk-replaced, so brownfield must not archive them merely because the incoming
+# ownership manifest lists them. The audit entry remains the separately composer-verified
+# persistent policy above.
+$copyIfAbsent = $persistentCopyIfAbsent + @(
+    'docs/wiki/INDEX.md', 'docs/ARCHITECTURE.md', 'docs/architecture-decisions.md'
+)
+
+# Signals that the target already has AI tooling and therefore needs /adopt, not /bootstrap. A shipped
+# path that collides with an existing file selects brownfield as well.
+$adoptionSignals = @('CLAUDE.md', 'AGENTS.md', 'GEMINI.md', '.cursorrules', '.cursor/rules',
+    '.clinerules', '.windsurfrules', '.roomodes', '.aider.conf.yml', '.continue',
+    '.github/copilot-instructions.md', '.github/instructions', '.github/chatmodes',
+    '.github/skills',
+    'docs/adr', 'docs/decisions', 'ARCHITECTURE.md', 'docs/ARCHITECTURE.md', 'CODEMAP.md',
+    'CONVENTIONS.md', 'docs/CONVENTIONS.md', 'TECH_DEBT.md', 'TODO.md', 'BACKLOG.md',
+    'docs/wiki/INDEX.md')
+
+$updateMode = Test-Path -LiteralPath (Join-Path $tgt '.claude/framework-version.json')
+$detected = @()
+if (-not $updateMode) {
+    $detected = @($adoptionSignals | Where-Object { Test-Path -LiteralPath (Join-Path $tgt $_) })
+}
+
+# The incoming manifest inventories installed files; the separately authored retirement ledger is
+# the only stale-path deletion authority. Validate both before any target mutation.
+$incomingManifest = Join-Path $src 'framework-ownership.json'
+try {
+    $incoming = Read-OwnershipManifest -Path $incomingManifest -Label 'incoming framework ownership manifest'
+    $incomingPaths = @($incoming.Entries | ForEach-Object { [string]$_.path })
+    foreach ($relative in $incomingPaths) {
+        if (-not (Test-Path -LiteralPath (Join-Path $src $relative) -PathType Leaf)) { throw "incoming manifest path '$relative' is not a shipped file" }
+    }
+    $retirementLedger = Read-RetirementLedger -Path (Join-Path $src 'framework-retirements.json')
+    foreach ($retiredPath in $retirementLedger.Keys) {
+        if ($incoming.ByPath.ContainsKey($retiredPath)) { throw "retirement '$retiredPath' is still present in the incoming ownership manifest" }
+    }
+} catch {
+    [Console]::Error.WriteLine("ERROR: Cannot validate incoming framework metadata: $($_.Exception.Message)")
+    exit 3
+}
+
+$incomingVersionPath = Join-Path $src '.claude/framework-version.json'
+try {
+    $incomingVersion = [string](Get-Content -Raw -LiteralPath $incomingVersionPath | ConvertFrom-Json).version
+    [void](Compare-ReleaseVersion -Left $incomingVersion -Right $incomingVersion)
+} catch {
+    [Console]::Error.WriteLine("ERROR: Cannot validate incoming framework version: $($_.Exception.Message)")
+    exit 3
+}
+# Before the downgrade check: an outdated clone is the likelier cause of a downgrade, and updating it
+# answers both.
+$sourceFreshness = Get-SourceFreshness
+if ($sourceFreshness.State -eq 'outdated' -and -not $AllowOutdated) {
+    [Console]::Error.WriteLine("ERROR: Refusing to install from an out-of-date framework copy: $($sourceFreshness.Detail). Update it ($($sourceFreshness.Update)), then re-run; pass -AllowOutdated only to install this older copy on purpose.")
+    exit 4
+}
+if ($updateMode) {
+    try {
+        $installedVersion = [string](Get-Content -Raw -LiteralPath (Join-Path $tgt '.claude/framework-version.json') | ConvertFrom-Json).version
+        $versionComparison = Compare-ReleaseVersion -Left $installedVersion -Right $incomingVersion
+    } catch {
+        [Console]::Error.WriteLine("CANT-VERIFY: Installed framework version cannot be compared safely: $($_.Exception.Message)")
+        exit 4
+    }
+    if ($versionComparison -gt 0 -and -not $AllowDowngrade) {
+        [Console]::Error.WriteLine("ERROR: Refusing framework downgrade from $installedVersion to $incomingVersion before mutation. Re-run with -AllowDowngrade only after reviewing the older release.")
+        exit 4
+    }
+}
+
+# Legal files need their own preservation decision: generic protection would freeze an explicitly
+# recognised prior licence; bulk copying would clobber consumer collisions. Preflight their policy
+# before mutation and use the licence decision when planning writes below.
+$legalLicense = 'LICENSES/ai-tech-lead-MIT.txt'
+$legalNotice = 'NOTICE-ai-tech-lead.md'
+$sourceLicense = Join-Path $src $legalLicense
+$targetLicense = Join-Path $tgt $legalLicense
+$targetNotice = Join-Path $tgt $legalNotice
+$copyLegalLicense = $true
+if (Test-Path -LiteralPath $targetLicense -PathType Leaf) {
+    $sourceText = [IO.File]::ReadAllText($sourceLicense) -replace "`r`n", "`n" -replace "`r", "`n"
+    $targetText = [IO.File]::ReadAllText($targetLicense) -replace "`r`n", "`n" -replace "`r", "`n"
+    if ($sourceText -ceq $targetText) {
+        $copyLegalLicense = $false
+    } else {
+        # Only the exact prior framework notice may migrate to the contributors attribution.
+        # Hash the whole normalized text so changed holders or MIT terms still refuse.
+        $licenseSha = [Security.Cryptography.SHA256]::Create()
+        try {
+            $targetLicenseHash = [BitConverter]::ToString($licenseSha.ComputeHash([Text.Encoding]::UTF8.GetBytes($targetText))).Replace('-', '').ToLowerInvariant()
+        } finally { $licenseSha.Dispose() }
+        if ($targetLicenseHash -cne '14d518c3282ed071127059700be0498802c3a89ddeca37e42150445f93a04e17') {
+            [Console]::Error.WriteLine("ERROR: Refusing to overwrite '$legalLicense': the existing file is not identical to the framework licence.")
+            exit 3
+        }
+    }
+}
+if ((Test-Path -LiteralPath $targetNotice -PathType Leaf) -and
+    -not ([IO.File]::ReadAllText($targetNotice).Contains('FRAMEWORK-OWNED'))) {
+    [Console]::Error.WriteLine("ERROR: Refusing to overwrite '$legalNotice': the existing file is not marked FRAMEWORK-OWNED.")
+    exit 3
+}
+
+# A shipped path already holding other bytes is consumer content the copy would overwrite, whether
+# or not it looks like AI tooling and whether or not Git can see it (untracked, ignored, no
+# repository), so it selects the brownfield archive. Identical bytes lose nothing and keep an
+# interrupted greenfield re-run greenfield; compare them raw, never line-ending-normalized.
+if (-not $updateMode) {
+    foreach ($relative in $incomingPaths) {
+        if ($relative -in $copyIfAbsent -or $relative -in @($legalLicense, $legalNotice)) { continue }
+        $existing = Get-ContainedTargetPath -Relative $relative
+        if (-not (Test-Path -LiteralPath $existing -PathType Leaf)) { continue }
+        # Never read through a link; the brownfield preflight refuses it by name.
+        if (Get-ReparsePointAncestor -Path $existing) { $detected += $relative; continue }
+        try {
+            $same = [Convert]::ToBase64String([IO.File]::ReadAllBytes($existing)) -ceq
+                [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $src $relative)))
+        } catch {
+            [Console]::Error.WriteLine("CANT-VERIFY: existing '$relative' could not be read to decide whether this install would overwrite it. Make it readable or move it aside, then re-run.")
+            exit 4
+        }
+        if (-not $same) { $detected += $relative }
+    }
+}
+# CLAUDE.md is both a signal and a collision: name each path once. Both lists hold fixed canonical
+# names, so the case-sensitive Select-Object -Unique is enough.
+$detected = @($detected | Select-Object -Unique)
+$adoptMode = (-not $updateMode) -and ($detected.Count -gt 0)
+
+# Previous ownership is consumer-mutable evidence, never deletion authority. Reconciliation is
+# enabled only when the whole previous manifest is valid, and every candidate also matches bytes
+# named by the incoming framework-authored ledger.
+$deletePlan = New-Object System.Collections.Generic.List[string]
+$retirementPreserve = New-Object System.Collections.Generic.List[string]
+$reconciliationMessages = New-Object System.Collections.Generic.List[string]
+if ($updateMode) {
+    $previousManifestPath = Join-Path $tgt 'framework-ownership.json'
+    if (-not (Test-Path -LiteralPath $previousManifestPath -PathType Leaf)) {
+        $reconciliationMessages.Add('CANT-VERIFY: previous framework-ownership.json is missing; additive compatibility mode will perform no stale deletion.')
+    } elseif (Get-ReparsePointAncestor -Path $previousManifestPath) {
+        $reconciliationMessages.Add('CANT-VERIFY: previous framework-ownership.json traverses a reparse/symlink; additive compatibility mode will perform no stale deletion.')
+    } else {
+        try {
+            $previous = Read-OwnershipManifest -Path $previousManifestPath -Label 'previous framework ownership manifest'
+        } catch {
+            $previous = $null
+            $reconciliationMessages.Add("CANT-VERIFY: previous framework-ownership.json is malformed or unsafe; additive compatibility mode will perform no stale deletion. $($_.Exception.Message)")
+        }
+        if ($previous) {
+            foreach ($retiredPath in @($retirementLedger.Keys | Sort-Object)) {
+                if (-not $previous.ByPath.ContainsKey($retiredPath) -or
+                    $previous.ByPath[$retiredPath] -ne 'framework-owned/overwritten' -or
+                    $incoming.ByPath.ContainsKey($retiredPath) -or $retiredPath -in $persistentCopyIfAbsent) { continue }
+                $candidate = Get-ContainedTargetPath -Relative $retiredPath
+                # Test-Path reports a dangling reparse point as absent. Resolve the directory
+                # entry itself so only a true ItemNotFound result can mean that this retirement
+                # candidate is absent; every other inspection failure is preservation evidence.
+                try { $candidateEntry = Get-LiteralItem -Path $candidate }
+                catch [Management.Automation.ItemNotFoundException] { continue }
+                catch {
+                    $reconciliationMessages.Add("CANT-VERIFY: retired path '$retiredPath' could not be examined; preserving it.")
+                    $retirementPreserve.Add($retiredPath)
+                    continue
+                }
+                $reparse = Get-ReparsePointAncestor -Path $candidate
+                if ($reparse) {
+                    $reconciliationMessages.Add("CANT-VERIFY: retired path '$retiredPath' traverses reparse/symlink '$reparse'; preserving it.")
+                    $retirementPreserve.Add($retiredPath)
+                    continue
+                }
+                if ($candidateEntry.PSIsContainer) {
+                    $reconciliationMessages.Add("CANT-VERIFY: retired path '$retiredPath' is not a regular file; preserving it.")
+                    $retirementPreserve.Add($retiredPath)
+                    continue
+                }
+                try {
+                    $digest = (Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash.ToLowerInvariant()
+                    if ($digest -notin @($retirementLedger[$retiredPath].Hashes) -and $candidateEntry.Length -le 2097152) {
+                        $digest = Get-LfSha256 -Bytes ([IO.File]::ReadAllBytes($candidate))
+                    }
+                }
+                catch {
+                    $reconciliationMessages.Add("CANT-VERIFY: retired path '$retiredPath' could not be hashed; preserving it.")
+                    $retirementPreserve.Add($retiredPath)
+                    continue
+                }
+                if ($digest -notin @($retirementLedger[$retiredPath].Hashes)) {
+                    $reconciliationMessages.Add("CANT-VERIFY: retired path '$retiredPath' has consumer-modified or unknown content; preserving it.")
+                    $retirementPreserve.Add($retiredPath)
+                    continue
+                }
+                $deletePlan.Add($retiredPath)
+            }
+        }
+    }
+}
+
+# Find one named directory entry without dereferencing it. Get-Item -Force sees a dangling link
+# where Test-Path reports false. A direct lookup also works when an ancestor grants traversal but
+# not directory-list permission; only ItemNotFound means absence, while any other failure escapes.
+function Get-GitChildEntry {
+    param([Parameter(Mandatory = $true)][string]$Directory, [Parameter(Mandatory = $true)][string]$Name)
+    try { return (Get-Item -Force -LiteralPath (Join-Path $Directory $Name) -ErrorAction Stop).FullName }
+    catch [Management.Automation.ItemNotFoundException] { return $null }
+}
+
+function Test-GitRepositoryEvidence {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $current = [IO.DirectoryInfo]::new([IO.Path]::GetFullPath($Path))
+    while ($null -ne $current) {
+        if (Get-GitChildEntry -Directory $current.FullName -Name '.git') { return $true }
+        $current = $current.Parent
+    }
+
+    # Bare repositories have no .git entry. Keep this signature deliberately strict: weakening it
+    # makes ordinary directories look repository-like and turns optional Git into a prerequisite.
+    $head = Get-GitChildEntry -Directory $Path -Name 'HEAD'
+    $objects = Get-GitChildEntry -Directory $Path -Name 'objects'
+    $refs = Get-GitChildEntry -Directory $Path -Name 'refs'
+    if (-not $head -or -not $objects -or -not $refs) { return $false }
+    $directory = [IO.FileAttributes]::Directory
+    $headAttributes = [IO.File]::GetAttributes($head)
+    $objectAttributes = [IO.File]::GetAttributes($objects)
+    $refAttributes = [IO.File]::GetAttributes($refs)
+    return (($headAttributes -band $directory) -eq 0 -and
+        ($objectAttributes -band $directory) -ne 0 -and ($refAttributes -band $directory) -ne 0)
+}
+
+# Windows PowerShell 5.1 promotes redirected native stderr to NativeCommandError when the caller's
+# preference is Stop. Keep the suppression function-local, capture stdout separately, and retain a
+# nullable exit so a launch failure can never be mistaken for exit 0. Preserve the record count as
+# well: a blank native stdout line normalizes to an empty string but is still non-empty status.
+function Invoke-GitText {
+    param([Parameter(Mandatory = $true)][string]$GitPath, [Parameter(Mandatory = $true)][string[]]$Arguments)
+    $priorPreference = $ErrorActionPreference
+    $stdout = @()
+    $exitCode = $null
+    try {
+        $ErrorActionPreference = 'Continue'
+        # LASTEXITCODE is maintained in the runspace's global scope. Creating a local variable here
+        # shadows the value the native adapter updates and makes a successful launch look absent.
+        $global:LASTEXITCODE = $null
+        try {
+            $stdout = @(& $GitPath @Arguments 2>$null)
+            $exitCode = $global:LASTEXITCODE
+        } catch {
+            $stdout = @()
+            $exitCode = $null
+        }
+    } finally {
+        $ErrorActionPreference = $priorPreference
+    }
+    $normalized = (@($stdout | ForEach-Object { ([string]$_).TrimEnd("`r") }) -join "`n")
+    return [pscustomobject]@{
+        Started = ($null -ne $exitCode)
+        ExitCode = $exitCode
+        Output = $normalized
+        RecordCount = $stdout.Count
+    }
+}
+
+function Stop-UnverifiableGitPreflight {
+    [Console]::Error.WriteLine('CANT-VERIFY: Git state for this update/brownfield target could not be verified safely. Unset Git routing variables, install or repair Git, or repair/remove corrupt repository metadata, then re-run the installer.')
+    exit 4
+}
+
+# The opt-in pre-commit convenience net was never installer-owned: it lives under .git, outside the
+# ownership manifest. A v0.83+ update therefore diagnoses it but never writes or deletes it. When a
+# safely contained default hook still calls a retired helper, keep that helper's complete executable
+# closure even if ordinary retirement rules would otherwise authorize deletion. Ambiguous routing is non-authority:
+# preserve every possible retired helper rather than following a custom or external hook path.
+$legacyGitHookRetiredDependencies = @(
+    'scripts/setup-git-hooks.ps1',
+    'scripts/setup-git-hooks.sh',
+    '.claude/hooks/guard.sh'
+)
+
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]]$Bytes)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($Bytes))).Replace('-', '').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+}
+
+# Bind the complete pre-move inventory independently of mutable per-move progress.  This is kept
+# byte-for-byte compatible with adoption-archive.ps1 so workflow Freeze can extend the installer
+# inventory before any workflow move without accepting a regenerated, reduced marker.
+function ConvertTo-AdoptionIdentitySegment {
+    param([AllowNull()][string]$Value)
+    return [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$Value))
+}
+
+function New-AdoptionInventoryIdentity {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Entries)
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($entry in @($Entries)) {
+        $line = @(
+            ([int]$entry.schemaVersion).ToString([Globalization.CultureInfo]::InvariantCulture)
+            (ConvertTo-AdoptionIdentitySegment -Value ([string]$entry.originalPath))
+            (ConvertTo-AdoptionIdentitySegment -Value ([string]$entry.destination))
+            ([string]$entry.sha256).ToLowerInvariant()
+            ([int64]$entry.byteLength).ToString([Globalization.CultureInfo]::InvariantCulture)
+            (ConvertTo-AdoptionIdentitySegment -Value ([string]$entry.owner))
+            (ConvertTo-AdoptionIdentitySegment -Value ([string]$entry.provenanceRevision))
+            (ConvertTo-AdoptionIdentitySegment -Value ([string]$entry.provenance))
+            (ConvertTo-AdoptionIdentitySegment -Value ([string]$entry.historyDepth))
+            (ConvertTo-AdoptionIdentitySegment -Value ([string]$entry.localModification))
+        ) -join '|'
+        $lines.Add($line)
+    }
+    $lines.Sort([StringComparer]::Ordinal)
+    $payload = "ai-tech-lead/archive-integrity/v1`n" + ($lines -join "`n")
+    return [pscustomobject][ordered]@{
+        schemaVersion = 1
+        algorithm     = 'SHA-256'
+        entryCount    = [int]$lines.Count
+        sha256        = Get-Sha256Hex -Bytes ([Text.Encoding]::UTF8.GetBytes($payload))
+    }
+}
+
+# Brownfield archives must retain their exact pre-move bytes and an examinable original-path
+# provenance record. Raw SHA-256 over the actual filesystem bytes is the preservation oracle; the
+# recorded Git revision/path is historical attribution only and never substitutes for it. Unknown
+# history is a named state ('unavailable'/'untracked'), not a fabricated author or a trust finding.
+function Resolve-AdoptionGit {
+    foreach ($name in @('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE')) {
+        if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($name, 'Process'))) { return $null }
+    }
+    $command = @(Get-Command git -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if ($command.Count -eq 0) { return $null }
+    return [string]$command[0].Source
+}
+
+function Get-AdoptionArchiveBaselineRevision {
+    $gitPath = Resolve-AdoptionGit
+    if (-not $gitPath) { return $null }
+    $head = Invoke-GitText -GitPath $gitPath -Arguments @('-C', $tgt, 'rev-parse', 'HEAD')
+    if ($head.Started -and $head.ExitCode -eq 0 -and $head.Output -match '^[0-9a-f]{40}$') { return $head.Output }
+    return $null
+}
+
+# The spelling the disk holds for a path found ignoring case: in each folder, its one entry of that
+# name, or the exact name where a case-sensitive folder (WSL, fsutil setCaseSensitiveInfo) holds
+# several. $null when a folder cannot be listed.
+function Get-DiskSpelling {
+    param([Parameter(Mandatory = $true)][string]$Relative)
+    $directory = $tgt
+    $segments = New-Object System.Collections.Generic.List[string]
+    foreach ($segment in $Relative.Split('/')) {
+        try { $names = @([IO.Directory]::GetFileSystemEntries($directory) | ForEach-Object { [IO.Path]::GetFileName($_) }) }
+        catch { return $null }
+        $sameName = @($names | Where-Object { $_.Equals($segment, [StringComparison]::OrdinalIgnoreCase) })
+        if ($sameName.Count -eq 1) { $name = $sameName[0] }
+        elseif ($sameName -ccontains $segment) { $name = $segment }
+        else { return $null }
+        $segments.Add($name)
+        $directory = [IO.Path]::Combine($directory, $name)
+    }
+    return ($segments -join '/')
+}
+
+function New-AdoptionArchiveEvidence {
+    param(
+        [Parameter(Mandatory = $true)][string]$OriginalRelative,
+        [Parameter(Mandatory = $true)][string]$DestinationRelative
+    )
+    $sourceFull = Get-ContainedTargetPath -Relative $OriginalRelative
+    $bytes = [IO.File]::ReadAllBytes($sourceFull)
+    $revision = $null; $provenance = 'unavailable'; $historyDepth = 'unavailable'; $localModification = 'unknown'
+    $gitPath = Resolve-AdoptionGit
+    if ($gitPath) {
+        $inside = Invoke-GitText -GitPath $gitPath -Arguments @('-C', $tgt, 'rev-parse', '--is-inside-work-tree')
+        if ($inside.Started -and $inside.ExitCode -eq 0 -and $inside.Output -ceq 'true') {
+            $shallow = Invoke-GitText -GitPath $gitPath -Arguments @('-C', $tgt, 'rev-parse', '--is-shallow-repository')
+            if ($shallow.Started -and $shallow.ExitCode -eq 0) { $historyDepth = if ($shallow.Output -ceq 'true') { 'shallow' } else { 'full' } }
+            # The disk matched the shipped name ignoring case; Git's pathspecs do not. A file Git tracks
+            # under the spelling the disk holds is recorded under that spelling, so its history reads.
+            # An untracked one keeps the shipped spelling that docs/pre-adoption/.gitignore and /adopt's
+            # personal-file check use.
+            $diskSpelling = Get-DiskSpelling -Relative $OriginalRelative
+            if ($diskSpelling -and $diskSpelling -cne $OriginalRelative) {
+                $listed = Invoke-GitText -GitPath $gitPath -Arguments @('-C', $tgt, 'ls-files', '--', ":(literal)$diskSpelling")
+                if ($listed.Started -and $listed.ExitCode -eq 0 -and @($listed.Output -split "`n") -ccontains $diskSpelling) { $OriginalRelative = $diskSpelling }
+            }
+            $tracked = Invoke-GitText -GitPath $gitPath -Arguments @('-C', $tgt, 'ls-files', '--error-unmatch', '--', $OriginalRelative)
+            if ($tracked.Started -and $tracked.ExitCode -eq 0) {
+                $provenance = 'tracked'
+                $log = Invoke-GitText -GitPath $gitPath -Arguments @('-C', $tgt, 'log', '-1', '--format=%H', '--', $OriginalRelative)
+                if ($log.Started -and $log.ExitCode -eq 0 -and $log.Output -match '^[0-9a-f]{40}$') { $revision = $log.Output }
+                $st = Invoke-GitText -GitPath $gitPath -Arguments @('-C', $tgt, 'status', '--porcelain', '--', $OriginalRelative)
+                if ($st.Started -and $st.ExitCode -eq 0) { $localModification = if ($st.RecordCount -gt 0) { 'modified' } else { 'clean' } }
+            } elseif ($tracked.Started -and $tracked.ExitCode -eq 1) {
+                # Only Git's explicit "not in the index" result is untracked. A failed query is
+                # unavailable examination, never a fabricated provenance finding.
+                $provenance = 'untracked'
+            }
+        }
+    }
+    return [ordered]@{
+        schemaVersion      = 1
+        originalPath        = $OriginalRelative
+        destination         = $DestinationRelative
+        sha256              = Get-Sha256Hex -Bytes $bytes
+        byteLength          = [int64]$bytes.LongLength
+        owner               = 'installer'
+        provenanceRevision  = $revision
+        provenance          = $provenance
+        historyDepth        = $historyDepth
+        localModification   = $localModification
+        verified            = $false
+    }
+}
+
+function New-LegacyGitHookInspection {
+    param([string]$Kind, [string]$Detail, [string[]]$Dependencies = @())
+    return [pscustomobject]@{ Kind = $Kind; Detail = $Detail; Dependencies = @($Dependencies) }
+}
+
+function Get-LegacyGitHookInspection {
+    foreach ($name in @('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE')) {
+        $value = [Environment]::GetEnvironmentVariable($name, 'Process')
+        if ($null -ne $value -and $value.Length -gt 0) {
+            return New-LegacyGitHookInspection -Kind 'CANT-VERIFY' -Dependencies $legacyGitHookRetiredDependencies `
+                -Detail "Git routing variable $name is set; the installer did not inspect or modify routed hook state."
+        }
+    }
+
+    try { $gitEntryPath = Get-GitChildEntry -Directory $tgt -Name '.git' }
+    catch {
+        return New-LegacyGitHookInspection -Kind 'CANT-VERIFY' -Dependencies $legacyGitHookRetiredDependencies `
+            -Detail 'the target .git entry could not be examined; no hook path was followed or modified.'
+    }
+    if (-not $gitEntryPath) {
+        try { $repositoryOutsideTarget = Test-GitRepositoryEvidence -Path $tgt }
+        catch {
+            return New-LegacyGitHookInspection -Kind 'CANT-VERIFY' -Dependencies $legacyGitHookRetiredDependencies `
+                -Detail 'repository evidence could not be examined; no hook path was followed or modified.'
+        }
+        if ($repositoryOutsideTarget) {
+            return New-LegacyGitHookInspection -Kind 'CANT-VERIFY' -Dependencies $legacyGitHookRetiredDependencies `
+                -Detail 'Git metadata is not a default .git directory contained by the selected target; linked, nested, bare, or external hook state was not inspected or modified.'
+        }
+        return New-LegacyGitHookInspection -Kind 'NONE' -Detail 'the target has no contained default Git hook.'
+    }
+
+    try { $gitEntry = Get-Item -Force -LiteralPath $gitEntryPath -ErrorAction Stop }
+    catch {
+        return New-LegacyGitHookInspection -Kind 'CANT-VERIFY' -Dependencies $legacyGitHookRetiredDependencies `
+            -Detail 'the target .git entry could not be examined; no hook path was followed or modified.'
+    }
+    if ((Get-ReparsePointAncestor -Path $gitEntryPath) -or -not $gitEntry.PSIsContainer) {
+        return New-LegacyGitHookInspection -Kind 'CANT-VERIFY' -Dependencies $legacyGitHookRetiredDependencies `
+            -Detail 'Git metadata is linked, external, or non-directory state; no hook path was followed or modified.'
+    }
+
+    try { $huskyEntry = Get-GitChildEntry -Directory $tgt -Name '.husky' }
+    catch {
+        return New-LegacyGitHookInspection -Kind 'CANT-VERIFY' -Dependencies $legacyGitHookRetiredDependencies `
+            -Detail 'the .husky routing surface could not be examined; no hook path was followed or modified.'
+    }
+    if ($huskyEntry) {
+        return New-LegacyGitHookInspection -Kind 'CANT-VERIFY' -Dependencies $legacyGitHookRetiredDependencies `
+            -Detail 'a .husky hook surface exists; it remains consumer-owned and was not inspected or modified.'
+    }
+
+    $gitCommands = @(Get-Command git -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if ($gitCommands.Count -eq 0) {
+        return New-LegacyGitHookInspection -Kind 'CANT-VERIFY' -Dependencies $legacyGitHookRetiredDependencies `
+            -Detail 'Git is unavailable, so core.hooksPath cannot be checked; no hook path was followed or modified.'
+    }
+    $hooksPath = Invoke-GitText -GitPath ([string]$gitCommands[0].Source) -Arguments @('-C', $tgt, 'config', '--get', 'core.hooksPath')
+    if (-not $hooksPath.Started -or $hooksPath.ExitCode -notin @(0, 1)) {
+        return New-LegacyGitHookInspection -Kind 'CANT-VERIFY' -Dependencies $legacyGitHookRetiredDependencies `
+            -Detail 'core.hooksPath could not be examined; no custom hook path was followed or modified.'
+    }
+    if ($hooksPath.ExitCode -eq 0) {
+        return New-LegacyGitHookInspection -Kind 'CANT-VERIFY' -Dependencies $legacyGitHookRetiredDependencies `
+            -Detail "core.hooksPath is configured as '$($hooksPath.Output)'; it remains consumer-owned and was not inspected or modified."
+    }
+
+    $hookRelative = '.git/hooks/pre-commit'
+    $hookPath = Get-ContainedTargetPath -Relative $hookRelative
+    $hookReparse = Get-ReparsePointAncestor -Path $hookPath
+    if ($hookReparse) {
+        return New-LegacyGitHookInspection -Kind 'CANT-VERIFY' -Dependencies $legacyGitHookRetiredDependencies `
+            -Detail "the default pre-commit path traverses reparse/symlink '$hookReparse'; it was not followed or modified."
+    }
+    try { $hookEntry = Get-LiteralItem -Path $hookPath }
+    catch [Management.Automation.ItemNotFoundException] {
+        return New-LegacyGitHookInspection -Kind 'NONE' -Detail 'the target has no default pre-commit hook.'
+    }
+    catch {
+        return New-LegacyGitHookInspection -Kind 'CANT-VERIFY' -Dependencies $legacyGitHookRetiredDependencies `
+            -Detail 'the default pre-commit hook could not be examined; it was not modified.'
+    }
+    if ($hookEntry.PSIsContainer -or $hookEntry.Length -gt 1048576) {
+        return New-LegacyGitHookInspection -Kind 'CANT-VERIFY' -Dependencies $legacyGitHookRetiredDependencies `
+            -Detail 'the default pre-commit hook is not a regular bounded text file; it was not modified.'
+    }
+
+    try {
+        $hookBytes = [IO.File]::ReadAllBytes($hookPath)
+        $hookText = [Text.UTF8Encoding]::new($false, $true).GetString($hookBytes)
+        $hookDigest = Get-Sha256Hex -Bytes $hookBytes
+    } catch {
+        return New-LegacyGitHookInspection -Kind 'CANT-VERIFY' -Dependencies $legacyGitHookRetiredDependencies `
+            -Detail 'the default pre-commit hook could not be read as UTF-8 text; it was not modified.'
+    }
+
+    $powerShellBody = $hookDigest -ceq 'd13676bfffea2c3199894f4a610b8931273e161ddbfcfcdc7628bf40e6ca9fb8'
+    $bashBody = $hookDigest -ceq '25da45aa780126e4d2b0a2b1bdf759462bf3fd92be01e6414ed496253c817357'
+    $powerShellReference = $hookText -match '(?i)(?:^|[\s"''\\/])(?:\./)?scripts[\\/]setup-git-hooks\.ps1(?=$|[\s"''`(){}\[\],;:])'
+    $bashSetupReference = $hookText -match '(?i)(?:^|[\s"''\\/])(?:\./)?scripts[\\/]setup-git-hooks\.sh(?=$|[\s"''`(){}\[\],;:])'
+    $bashGuardReference = $hookText -match '(?i)(?:^|[\s"''\\/])(?:\./)?\.claude[\\/]hooks[\\/]guard\.sh(?=$|[\s"''`(){}\[\],;:])'
+    $dependencies = New-Object System.Collections.Generic.List[string]
+    if ($powerShellBody -or $powerShellReference) { $dependencies.Add('scripts/setup-git-hooks.ps1') }
+    if ($bashBody -or $bashSetupReference -or $bashGuardReference) {
+        $dependencies.Add('scripts/setup-git-hooks.sh')
+        $dependencies.Add('.claude/hooks/guard.sh')
+    }
+    if ($dependencies.Count -gt 0) {
+        $flavour = if ($bashBody -or $bashSetupReference -or $bashGuardReference) { 'Bash/degraded and unmaintained' } else { 'PowerShell' }
+        return New-LegacyGitHookInspection -Kind 'LEGACY' -Dependencies @($dependencies | Sort-Object -Unique) `
+            -Detail "$flavour legacy pre-commit references retired framework helpers."
+    }
+    return New-LegacyGitHookInspection -Kind 'CUSTOM' -Detail 'an unrelated custom default pre-commit hook exists; it remains consumer-owned and was not modified.'
+}
+
+function Add-LegacyDependencyPreserve {
+    param([Parameter(Mandatory = $true)][string]$Relative)
+    if (-not $retirementLedger.ContainsKey($Relative)) { return }
+    $wasPlannedForDeletion = $deletePlan.Remove($Relative)
+    $candidate = Get-ContainedTargetPath -Relative $Relative
+    $entryExists = $false
+    try { $entryExists = $null -ne (Get-Item -Force -LiteralPath $candidate -ErrorAction Stop) }
+    catch [Management.Automation.ItemNotFoundException] { $entryExists = $false }
+    catch { $entryExists = $true }
+    if (($wasPlannedForDeletion -or $entryExists) -and -not $retirementPreserve.Contains($Relative)) {
+        $retirementPreserve.Add($Relative)
+    }
+}
+
+$legacyGitHookInspection = if ($updateMode) { Get-LegacyGitHookInspection } else { New-LegacyGitHookInspection -Kind 'NONE' -Detail 'legacy hook inspection applies only to updates.' }
+if ($legacyGitHookInspection.Kind -eq 'LEGACY') {
+    foreach ($relative in $legacyGitHookInspection.Dependencies) { Add-LegacyDependencyPreserve -Relative $relative }
+    $reconciliationMessages.Add("MIGRATION: $($legacyGitHookInspection.Detail) The consumer-owned .git/hooks/pre-commit was not changed; preserving present dependency files from $($legacyGitHookInspection.Dependencies -join ', '). Remove or replace the hook manually before deleting those helpers.")
+} elseif ($legacyGitHookInspection.Kind -eq 'CANT-VERIFY') {
+    foreach ($relative in $legacyGitHookInspection.Dependencies) { Add-LegacyDependencyPreserve -Relative $relative }
+    $reconciliationMessages.Add("CANT-VERIFY: Legacy Git-hook retirement could not be classified safely because $($legacyGitHookInspection.Detail) Potential retired helper dependencies were preserved.")
+} elseif ($legacyGitHookInspection.Kind -eq 'CUSTOM') {
+    $reconciliationMessages.Add("NOTICE: $($legacyGitHookInspection.Detail)")
+}
+
+# A retirement can delete only where the immediately previous manifest grants authority. That
+# limitation must not hide high-risk residuals on later updates after the new manifest no longer
+# owns them. Inspect exact ledger paths read-only; this diagnostic grants no deletion authority.
+if ($updateMode) {
+    foreach ($retiredPath in @($retirementLedger.Keys | Sort-Object)) {
+        $isGitHubSkill = $retiredPath -match '^\.github/skills/([^/]+)/'
+        $slug = if ($isGitHubSkill) { $Matches[1] } else { $null }
+        $isRetiredSyncScript = $retiredPath -in @('scripts/sync-agent-files.ps1', 'scripts/sync-agent-files.sh')
+        $isRetiredGitHookHelper = $retiredPath -in $legacyGitHookRetiredDependencies
+        # Every retained retired path is reported. This was an allow-list of five categories, so a
+        # path retired in any later release was preserved in silence -- and each new retirement had
+        # to remember to add itself, which is the same shape of defect the list was added to fix.
+        # Specific advice below still wins where it exists; the generic arm covers the rest.
+        if ($deletePlan.Contains($retiredPath)) { continue }
+        $candidate = Get-ContainedTargetPath -Relative $retiredPath
+        try { $entry = Get-LiteralItem -Path $candidate }
+        catch [Management.Automation.ItemNotFoundException] { continue }
+        catch {
+            $reconciliationMessages.Add("CANT-VERIFY: retained retired path '$retiredPath' could not be examined; preserving it without inspection.")
+            continue
+        }
+        $reparse = Get-ReparsePointAncestor -Path $candidate
+        if ($reparse) {
+            $reconciliationMessages.Add("CANT-VERIFY: retained retired path '$retiredPath' traverses reparse/symlink '$reparse'; preserving it without inspection.")
+            continue
+        }
+        if ($isGitHubSkill) {
+            $reconciliationMessages.Add("CANT-VERIFY: retained retired path '$retiredPath' was not deleted; it may shadow canonical .claude/skills/$slug. Move intentional customization to .claude/skills/$slug and remove the retained GitHub copy after review.")
+        } elseif ($isRetiredSyncScript) {
+            $reconciliationMessages.Add("CANT-VERIFY: retained retired path '$retiredPath' was not deleted; running it may recreate higher-priority .github/skills shadows. Do not run it; migrate or retire it after review.")
+        } elseif ($isRetiredGitHookHelper) {
+            $reconciliationMessages.Add("CANT-VERIFY: retained retired Git-hook helper '$retiredPath' remains. Remove it only after confirming no consumer-owned hook depends on it; run $followUpPowerShell scripts/framework-doctor.ps1 for the current classification.")
+        } elseif ($retiredPath -eq 'scripts/ci/bitbucket-pipelines.example.yml') {
+            $reconciliationMessages.Add("CANT-VERIFY: retained retired sample '$retiredPath' remains. It targets an unsupported Linux container; remove it after review and use a Windows/PowerShell CI example instead.")
+        } elseif ($retiredPath -in @('scripts/build-architecture-html.ps1', 'scripts/build-architecture-html.sh')) {
+            $reconciliationMessages.Add("CANT-VERIFY: retained retired generator '$retiredPath' remains. The generated architecture view is retired and has no replacement command; its output loaded third-party script from the network each time it was opened. Read docs/ARCHITECTURE.md directly, then remove this generator and any page it produced after review.")
+        } elseif ($retiredPath.StartsWith('docs/presentation/', [StringComparison]::Ordinal)) {
+            $reconciliationMessages.Add("CANT-VERIFY: retained retired presentation file '$retiredPath' remains. The deck is no longer installed; the current copy is in '$(Join-Path $src 'presentation')'. Delete '$retiredPath' after review.")
+        } else {
+            $twin = if ($retiredPath.EndsWith('.sh', [StringComparison]::OrdinalIgnoreCase)) {
+                $retiredPath.Substring(0, $retiredPath.Length - 3) + '.ps1'
+            } else { $null }
+            # Naming a twin that is itself retired sends the consumer to another dead path.
+            if ($twin -and -not $retirementLedger.ContainsKey($twin)) {
+                $reconciliationMessages.Add("CANT-VERIFY: retained retired framework path '$retiredPath' remains. Do not execute it; migrate references to '$twin' and remove the retired file after review.")
+            } else {
+                $reconciliationMessages.Add("CANT-VERIFY: retained retired framework path '$retiredPath' remains. It is retired with no replacement command; remove the file and any reference to it after review.")
+            }
+        }
+    }
+}
+
+# Protected carriers and consumer CI are not overwritten merely to repair stale commands. Report
+# exact current-release retirements and a concrete replacement before the WhatIf boundary so dry-run
+# and apply classify the same bytes. Enumeration is bounded and never follows reparse points.
+$retiredReferenceReplacements = @{}
+if ($updateMode -and (Compare-ReleaseVersion -Left $incomingVersion -Right '0.83.0') -ge 0) {
+    $retiredReferenceReplacements['install.sh'] = "$followUpPowerShell install.ps1"
+    $retiredReferenceReplacements['scripts/install.sh'] = "$followUpPowerShell scripts/install.ps1"
+}
+foreach ($retiredPath in $(if ($updateMode) { @($retirementLedger.Keys) } else { @() })) {
+    # Keep diagnostics cumulative: a consumer may skip the release that first retired the path.
+    if ((Compare-ReleaseVersion -Left $retirementLedger[$retiredPath].Version -Right $incomingVersion) -gt 0) { continue }
+    if ($retiredPath -in @('scripts/setup-git-hooks.ps1', 'scripts/setup-git-hooks.sh')) {
+        $retiredReferenceReplacements[$retiredPath] = "the setup feature is retired; inspect .git/hooks/pre-commit, remove or replace the old convenience hook manually, then run $followUpPowerShell scripts/framework-doctor.ps1"
+    } elseif ($retiredPath -eq 'scripts/ci/bitbucket-pipelines.example.yml') {
+        $retiredReferenceReplacements[$retiredPath] = "the Linux container sample is retired; use a Windows runner with $followUpPowerShell scripts/docs-sync-check.ps1"
+    } elseif ($retiredPath -in @('scripts/build-architecture-html.ps1', 'scripts/build-architecture-html.sh')) {
+        # Both twins retire with no successor command. The generic .sh arm below would name a .ps1
+        # that is itself retired, and would stop emitting entirely once that .ps1 left the incoming
+        # manifest -- silently dropping a migration message the consumer already relied on.
+        $retiredReferenceReplacements[$retiredPath] = 'the generated architecture view is retired; read docs/ARCHITECTURE.md directly'
+    } elseif ($retiredPath.EndsWith('.sh', [StringComparison]::OrdinalIgnoreCase)) {
+        $powerShellPath = $retiredPath.Substring(0, $retiredPath.Length - 3) + '.ps1'
+        if ($incoming.ByPath.ContainsKey($powerShellPath)) {
+            $retiredReferenceReplacements[$retiredPath] = "$followUpPowerShell $powerShellPath"
+        } else {
+            # The twin is retired or gone, so there is no successor to name. Emitting nothing here
+            # is how a stale reference survives with no diagnostic at all.
+            $retiredReferenceReplacements[$retiredPath] = 'that feature is retired and has no replacement command; remove the reference'
+        }
+    }
+}
+
+$protectedReferenceCandidates = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+foreach ($relative in $protected + @('.claude/settings.local.json', '.gitlab-ci.yml', '.gitlab-ci.yaml',
+    'azure-pipelines.yml', 'azure-pipelines.yaml', 'bitbucket-pipelines.yml', 'bitbucket-pipelines.yaml',
+    'Jenkinsfile')) { [void]$protectedReferenceCandidates.Add($relative) }
+
+function Add-BoundedReferenceDirectory {
+    param([string]$Relative, [int]$MaxDepth, [string[]]$Extensions)
+    $directory = Get-ContainedTargetPath -Relative $Relative
+    $rootReparse = Get-ReparsePointAncestor -Path $directory
+    if ($rootReparse) {
+        $reconciliationMessages.Add("CANT-VERIFY: protected reference directory '$Relative' traverses reparse/symlink '$rootReparse'; it was not followed.")
+        return
+    }
+    try { $rootEntry = Get-LiteralItem -Path $directory }
+    catch [Management.Automation.ItemNotFoundException] { return }
+    catch { $reconciliationMessages.Add("CANT-VERIFY: protected reference directory '$Relative' could not be examined; no stale-command conclusion was inferred."); return }
+    if (($rootEntry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or -not $rootEntry.PSIsContainer) {
+        $reconciliationMessages.Add("CANT-VERIFY: protected reference directory '$Relative' is linked or not a directory; it was not traversed.")
+        return
+    }
+    $queue = New-Object System.Collections.Generic.Queue[object]
+    $queue.Enqueue([pscustomobject]@{ Directory = $rootEntry; Depth = 0 })
+    while ($queue.Count -gt 0) {
+        $current = $queue.Dequeue()
+        try { $children = @(Get-ChildItem -Force -LiteralPath $current.Directory.FullName -ErrorAction Stop) }
+        catch {
+            $underTarget = $current.Directory.FullName.Substring($tgt.Length).TrimStart('\', '/') -replace '\\', '/'
+            $reconciliationMessages.Add("CANT-VERIFY: protected reference directory '$underTarget' could not be enumerated; no stale-command conclusion was inferred.")
+            continue
+        }
+        foreach ($child in $children) {
+            $childRelative = $child.FullName.Substring($tgt.Length).TrimStart('\', '/') -replace '\\', '/'
+            if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                $reconciliationMessages.Add("CANT-VERIFY: protected reference candidate '$childRelative' is a reparse/symlink and was not followed.")
+                continue
+            }
+            if ($child.PSIsContainer) {
+                if ($current.Depth -lt $MaxDepth) { $queue.Enqueue([pscustomobject]@{ Directory = $child; Depth = $current.Depth + 1 }) }
+            } elseif ($Extensions -contains $child.Extension) {
+                [void]$protectedReferenceCandidates.Add($childRelative)
+            }
+        }
+    }
+}
+
+Add-BoundedReferenceDirectory -Relative '.github/workflows' -MaxDepth 0 -Extensions @('.yml', '.yaml')
+Add-BoundedReferenceDirectory -Relative 'bamboo-specs' -MaxDepth 3 -Extensions @('.yml', '.yaml', '.xml', '.java')
+
+foreach ($relative in @($protectedReferenceCandidates | Sort-Object)) {
+    if ($incoming.ByPath.ContainsKey($relative) -and $incoming.ByPath[$relative] -eq 'framework-owned/overwritten') { continue }
+    $candidate = Get-ContainedTargetPath -Relative $relative
+    $reparse = Get-ReparsePointAncestor -Path $candidate
+    if ($reparse) {
+        $reconciliationMessages.Add("CANT-VERIFY: protected reference candidate '$relative' traverses reparse/symlink '$reparse' and was not read.")
+        continue
+    }
+    try { $entry = Get-LiteralItem -Path $candidate }
+    catch [Management.Automation.ItemNotFoundException] { continue }
+    catch { $reconciliationMessages.Add("CANT-VERIFY: protected reference candidate '$relative' could not be examined; no stale-command conclusion was inferred."); continue }
+    if ($entry.PSIsContainer -or $entry.Length -gt 2097152) {
+        $reconciliationMessages.Add("CANT-VERIFY: protected reference candidate '$relative' is not a regular bounded file and was not read.")
+        continue
+    }
+    try { $content = [Text.UTF8Encoding]::new($false, $true).GetString([IO.File]::ReadAllBytes($candidate)) -replace '\\', '/' }
+    catch { $reconciliationMessages.Add("CANT-VERIFY: protected reference candidate '$relative' could not be read as UTF-8; no stale-command conclusion was inferred."); continue }
+    foreach ($retiredPath in @($retiredReferenceReplacements.Keys | Sort-Object)) {
+        $pattern = '(?i)(?<![A-Za-z0-9_./-])(?:\./)?' + [regex]::Escape($retiredPath) + '(?=$|[\s"''`(){}\[\],;:])'
+        if ($content -match $pattern) {
+            $reconciliationMessages.Add("MIGRATION: protected consumer carrier '$relative' names retired framework path '$retiredPath'. It was not overwritten; replace that reference with: $($retiredReferenceReplacements[$retiredPath]).")
+        }
+    }
+}
+
+# Git is optional for a plain target, but repository evidence or redirected Git state must never be
+# reinterpreted as non-Git. Refuse before mutation unless Git authoritatively identifies the target
+# and its porcelain status can be read through the selected target path.
+if (-not $WhatIf -and ($adoptMode -or $updateMode)) {
+    foreach ($name in @('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE')) {
+        $value = [Environment]::GetEnvironmentVariable($name, 'Process')
+        if ($null -ne $value -and $value.Length -gt 0) { Stop-UnverifiableGitPreflight }
+    }
+
+    try { $repositoryEvidence = Test-GitRepositoryEvidence -Path $tgt }
+    catch { Stop-UnverifiableGitPreflight }
+
+    $gitCommands = @(Get-Command git -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if ($gitCommands.Count -eq 0) {
+        if ($repositoryEvidence) { Stop-UnverifiableGitPreflight }
+    } else {
+        $gitPath = [string]$gitCommands[0].Source
+        $probe = Invoke-GitText -GitPath $gitPath -Arguments @('-C', $tgt, 'rev-parse', '--is-inside-work-tree')
+        if ($probe.Started -and $probe.ExitCode -eq 0) {
+            if ($probe.Output -cne 'true') { Stop-UnverifiableGitPreflight }
+            $status = Invoke-GitText -GitPath $gitPath -Arguments @('--no-optional-locks', '-C', $tgt, 'status', '--porcelain=v1', '--untracked-files=all')
+            if (-not $status.Started -or $status.ExitCode -ne 0) {
+                [Console]::Error.WriteLine('CANT-VERIFY: Git identified this target as a worktree, but its status could not be read. Commit, stash, or copy local changes, then repair Git and re-run the installer.')
+                exit 4
+            }
+            if ($status.RecordCount -gt 0) {
+                if (-not $AllowDirtyTree) {
+                    [Console]::Error.WriteLine('ERROR: Refusing to mutate a dirty Git target. Commit, stash, or copy local changes, then re-run; use -AllowDirtyTree only after doing so deliberately.')
+                    exit 4
+                }
+                Write-Output '  override: -AllowDirtyTree accepted for this dirty Git target.'
+            }
+        } elseif ($repositoryEvidence) {
+            Stop-UnverifiableGitPreflight
+        }
+    }
+}
+
+Write-Output "Installing AI Tech Lead Framework"
+Write-Output "  from: $src"
+Write-Output "  into: $tgt"
+if ($updateMode)    { Write-Output "  mode: update (existing install detected via .claude/framework-version.json)" }
+elseif ($adoptMode) { Write-Output "  mode: brownfield (pre-existing AI tooling, or files this install would overwrite: $($detected -join ', '))" }
+else                { Write-Output "  mode: greenfield" }
+if ($updateMode -and $versionComparison -gt 0 -and $AllowDowngrade) {
+    Write-Output "  override: -AllowDowngrade accepted for downgrade $installedVersion -> $incomingVersion."
+}
+if ($sourceFreshness.State -in @('current', 'skipped')) { Write-Output "  source: $($sourceFreshness.Detail)." }
+elseif ($sourceFreshness.State -eq 'outdated') { Write-Output "  override: -AllowOutdated accepted: $($sourceFreshness.Detail)." }
+else { Write-Output "  NOTE: could not check that this framework copy is up to date: $($sourceFreshness.Detail). Confirm it is the newest release before you rely on this install." }
+foreach ($message in $reconciliationMessages) { Write-Output "  $message" }
+
+if ($updateMode) {
+    Write-Output "  UPDATE PREFLIGHT: This update replaces framework-owned files, including .claude/settings.json."
+    Write-Output "  Ensure any local edits to those files were committed, stashed, or copied first."
+    Write-Output "  Review the resulting diff before committing."
+}
+
+$archived = @()
+$archivePlan = New-Object System.Collections.Generic.List[object]
+if ($adoptMode) {
+    # Screen-in-place carriers remain at their consumer-owned paths, but only regular in-repo
+    # files qualify. Refuse links/non-files before the broad collision loop skips them.
+    foreach ($f in $copyIfAbsent) {
+        $candidate = Join-Path $tgt $f
+        $sourceReparse = Get-ReparsePointAncestor -Path $candidate
+        if ($sourceReparse) {
+            [Console]::Error.WriteLine("ERROR: Refusing screen-in-place path '$f': source path traverses reparse/symlink '$sourceReparse'. Remove the link or copy the original into the repository, then re-run.")
+            exit 3
+        }
+        if ((Test-Path -LiteralPath $candidate) -and -not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            [Console]::Error.WriteLine("ERROR: Refusing screen-in-place path '$f': the target path is not a regular file.")
+            exit 3
+        }
+    }
+    $archivePaths = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    foreach ($f in $incomingPaths) {
+        if ($f -in $copyIfAbsent -or $f -in @($legalLicense, $legalNotice)) { continue }
+        $orig = Join-Path $tgt $f
+        $sourceReparse = Get-ReparsePointAncestor -Path $orig
+        if ($sourceReparse) {
+            [Console]::Error.WriteLine("ERROR: Refusing brownfield collision '$f': source path traverses reparse/symlink '$sourceReparse'. Remove the link or copy the original into the repository, then re-run.")
+            exit 3
+        }
+        if (-not (Test-Path -LiteralPath $orig)) { continue }
+        if (-not (Test-Path -LiteralPath $orig -PathType Leaf)) {
+            [Console]::Error.WriteLine("ERROR: Refusing brownfield collision '$f': the target path is not a file and cannot be archived safely.")
+            exit 3
+        }
+        $rel = 'docs/pre-adoption/' + $f
+        $dest = Join-Path $tgt $rel
+        $destinationReparse = Get-ReparsePointAncestor -Path $dest
+        if ($destinationReparse) {
+            [Console]::Error.WriteLine("ERROR: Refusing brownfield install: archive destination traverses reparse/symlink '$destinationReparse'. Remove the link, then re-run.")
+            exit 3
+        }
+        if (-not $archivePaths.Add($rel) -or (Test-Path -LiteralPath $dest)) {
+            [Console]::Error.WriteLine("ERROR: Refusing brownfield install: archive destination already exists or is ambiguous: '$rel'.")
+            exit 3
+        }
+        $parent = Split-Path -Parent $dest
+        while ($parent -and $parent.StartsWith($tgt, [StringComparison]::OrdinalIgnoreCase)) {
+            if ((Test-Path -LiteralPath $parent) -and -not (Test-Path -LiteralPath $parent -PathType Container)) {
+                [Console]::Error.WriteLine("ERROR: Refusing brownfield install: archive destination parent is not a directory: '$parent'.")
+                exit 3
+            }
+            if ($parent -eq $tgt) { break }
+            $parent = Split-Path -Parent $parent
+        }
+        $archivePlan.Add([pscustomobject]@{ Original = $orig; OriginalRelative = $f; Relative = $rel; Destination = $dest })
+    }
+}
+
+# Compute the complete deployment/reconciliation plan before the first target mutation. Legacy
+# snapshot/restore writes are gone: protected files are skipped directly, and every skill backup
+# and disable leaf is planned and preflighted before execution.
+$createPlan = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+$replacePlan = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+$preservePlan = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+$archiveSources = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+$ordinaryApplyPaths = New-Object System.Collections.Generic.List[string]
+$skillBackupPlan = New-Object System.Collections.Generic.List[object]
+$disabledCarryPlan = New-Object System.Collections.Generic.List[object]
+$disabledIncomingPlan = New-Object System.Collections.Generic.List[object]
+$skillDeletePlan = New-Object System.Collections.Generic.List[string]
+foreach ($entry in $archivePlan) { [void]$archiveSources.Add($entry.Relative.Substring('docs/pre-adoption/'.Length)) }
+
+function Add-PlannedWrite {
+    param([string]$Relative, [switch]$ForceCreate)
+    $destination = Assert-SafeTargetMutation -Relative $Relative
+    [void]$preservePlan.Remove($Relative)
+    if ($ForceCreate -or -not (Test-Path -LiteralPath $destination)) {
+        [void]$replacePlan.Remove($Relative); [void]$createPlan.Add($Relative)
+    } else {
+        [void]$createPlan.Remove($Relative); [void]$replacePlan.Add($Relative)
+    }
+    return $destination
+}
+
+$disabledSkillNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+$discoveredSkillNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+$skillExemplars = @{}
+$incomingFrameworkSkillNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+$incoming.Entries | ForEach-Object {
+    $frameworkSkill = [regex]::Match([string]$_.path, '^\.claude/skills/([^/]+)/')
+    if ($frameworkSkill.Success -and [string]$_.ownership -eq 'framework-owned/overwritten') {
+        [void]$incomingFrameworkSkillNames.Add($frameworkSkill.Groups[1].Value)
+    }
+}
+$activeSkillsRoot = Join-Path $tgt '.claude/skills'
+if ($updateMode) {
+    $learnings = Join-Path $tgt 'LEARNINGS.md'
+    if (Test-Path -LiteralPath $learnings -PathType Leaf) {
+        foreach ($m in [regex]::Matches((Get-Content -Raw -LiteralPath $learnings), '(?m)^## Disabled framework skill:\s*([a-z0-9-]+)\s*$')) { [void]$disabledSkillNames.Add($m.Groups[1].Value) }
+    }
+    if (Test-Path -LiteralPath $activeSkillsRoot -PathType Container) {
+        foreach ($item in Get-ChildItem -LiteralPath $activeSkillsRoot -Recurse -Force) {
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                [Console]::Error.WriteLine("ERROR: Refusing update skill reconciliation: '$($item.FullName)' is a reparse/symlink."); exit 3
+            }
+        }
+        foreach ($skillDir in Get-ChildItem -LiteralPath $activeSkillsRoot -Directory) {
+            $skillFile = Join-Path $skillDir.FullName 'SKILL.md'
+            if (-not (Test-Path -LiteralPath $skillFile -PathType Leaf)) { continue }
+            $oldText = [Text.UTF8Encoding]::new($false, $true).GetString([IO.File]::ReadAllBytes($skillFile))
+            if ($oldText -match '(?m)^origin:\s*discovered\s*$') { [void]$discoveredSkillNames.Add($skillDir.Name); continue }
+            # An exemplar belongs to a framework skill only when this incoming manifest still
+            # carries that skill. Rewriting an unknown consumer skill just to re-append the same
+            # line changes its bytes despite the framework having no ownership of that path.
+            if (-not $incomingFrameworkSkillNames.Contains($skillDir.Name)) { continue }
+            $exemplar = [regex]::Match($oldText, '(?m)^For a concrete current instance in this repo, see .+$')
+            if ($exemplar.Success) { $skillExemplars[$skillDir.Name] = $exemplar.Value }
+        }
+    }
+}
+
+# The one-time backup is a set of leaf copies, not an opaque recursive directory mutation. It is taken
+# while its folder is absent, or again while the marker beside it exists: written before the folder is
+# created and deleted after the last copy, so a held file or an interruption never leaves a partial
+# backup that later runs mistake for the whole one.
+$backupSkillsRoot = Join-Path $tgt '.claude/framework-update-backup/skills'
+$backupIncompleteRelative = '.claude/framework-update-backup/skills-backup-incomplete'
+if ($updateMode -and (Test-Path -LiteralPath $activeSkillsRoot -PathType Container) -and
+    (-not (Test-Path -LiteralPath $backupSkillsRoot) -or (Test-Path -LiteralPath (Join-Path $tgt $backupIncompleteRelative) -PathType Leaf))) {
+    [void](Assert-SafeTargetMutation -Relative $backupIncompleteRelative)
+    foreach ($file in Get-ChildItem -LiteralPath $activeSkillsRoot -Recurse -File -Force) {
+        $underSkills = $file.FullName.Substring($activeSkillsRoot.Length).TrimStart('\', '/') -replace '\\', '/'
+        # A retired skill file is known framework content that the retirement loop deletes first.
+        if ($deletePlan -contains ".claude/skills/$underSkills") { continue }
+        $relative = ".claude/framework-update-backup/skills/$underSkills"
+        [void](Add-PlannedWrite -Relative $relative -ForceCreate)
+        $skillBackupPlan.Add([pscustomobject]@{ Source = $file.FullName; Relative = $relative })
+    }
+}
+
+# Preserve every existing leaf of a disabled skill in its inactive location, then overlay the
+# incoming framework version. Active copies are removed as explicit tree operations.
+foreach ($name in $disabledSkillNames) {
+    $activeRoot = Join-Path $activeSkillsRoot $name
+    if (Test-Path -LiteralPath $activeRoot -PathType Container) {
+        foreach ($file in Get-ChildItem -LiteralPath $activeRoot -Recurse -File -Force) {
+            $underSkill = $file.FullName.Substring($activeRoot.Length).TrimStart('\', '/') -replace '\\', '/'
+            $relative = ".claude/disabled-skills/$name/$underSkill"
+            [void](Add-PlannedWrite -Relative $relative)
+            $disabledCarryPlan.Add([pscustomobject]@{ Source = $file.FullName; Relative = $relative })
+        }
+        [void](Assert-SafeTargetMutation -Relative ".claude/skills/$name" -AllowTree)
+        $skillDeletePlan.Add(".claude/skills/$name")
+    }
+}
+
+foreach ($relative in $incomingPaths) {
+    $claudeSkill = [regex]::Match($relative, '^\.claude/skills/([^/]+)/(.*)$')
+    if ($updateMode -and $claudeSkill.Success -and $disabledSkillNames.Contains($claudeSkill.Groups[1].Value)) {
+        $inactive = ".claude/disabled-skills/$($claudeSkill.Groups[1].Value)/$($claudeSkill.Groups[2].Value)"
+        [void](Add-PlannedWrite -Relative $inactive)
+        $disabledIncomingPlan.Add([pscustomobject]@{ Source = $relative; Relative = $inactive })
+        continue
+    }
+    $destination = Get-ContainedTargetPath -Relative $relative
+    $exists = $null -ne (Get-Item -Force -LiteralPath $destination -ErrorAction SilentlyContinue)
+    $preserveDiscovered = $claudeSkill.Success -and $discoveredSkillNames.Contains($claudeSkill.Groups[1].Value)
+    $preserve = $exists -and ($relative -in $copyIfAbsent -or
+        ($updateMode -and $relative -in $protected -and $relative -ne $legalLicense) -or
+        ($relative -eq $legalLicense -and -not $copyLegalLicense) -or $preserveDiscovered)
+    if ($preserve) { [void]$preservePlan.Add($relative); continue }
+    [void](Add-PlannedWrite -Relative $relative -ForceCreate:$archiveSources.Contains($relative))
+    $ordinaryApplyPaths.Add($relative)
+}
+foreach ($relative in $retirementPreserve) { [void]$preservePlan.Add($relative) }
+
+# One-time instruction-layout move. The older layout kept the project instructions in
+# CLAUDE.md and a generated mirror in AGENTS.md; now AGENTS.md holds them and CLAUDE.md is a stub
+# importing it and the framework rules. Both stay protected, so only this block moves them, and
+# only when nothing can be lost: CLAUDE.md does not import AGENTS.md yet, and AGENTS.md is absent
+# or carries the retired GENERATED FILE banner (derived text). Both originals are backed up
+# first. A hand-written AGENTS.md is left alone; session-start and template-checks then ask the
+# consumer to merge by hand.
+function ConvertTo-AgentsInstructionText {
+    param([Parameter(Mandatory = $true)][string]$Text)
+    # Split on LF only, so each line keeps its own CR and untouched lines round-trip byte-for-byte.
+    $out = New-Object System.Collections.Generic.List[string]
+    $dropBlank = $false
+    $inFence = $false
+    $inHeader = $true
+    foreach ($line in $Text.Split([char]10)) {
+        $core = $line.TrimEnd([char]13)
+        $cr = $line.Substring($core.Length)
+        if ($dropBlank) { $dropBlank = $false; if ($core.Trim() -eq '') { continue } }
+        if ($core -match '^\s*(```|~~~)') { $inFence = -not $inFence; $out.Add($line); continue }
+        if ($inFence) { $out.Add($line); continue }
+        if ($core.StartsWith('## ')) { $inHeader = $false }
+        if ($core.Trim() -cin @('@.github/instructions/framework-rules.instructions.md', '@./.github/instructions/framework-rules.instructions.md')) {
+            # The import moves to the stub, together with the shipped comment that labelled it: one
+            # or two lines directly above, opening with FRAMEWORK-OWNED. Nothing else is removed.
+            $end = $out.Count - 1
+            if ($end -ge 0 -and $out[$end].TrimEnd().EndsWith('-->')) {
+                if ($out[$end].TrimStart().StartsWith('<!-- FRAMEWORK-OWNED')) { $out.RemoveAt($end) }
+                elseif ($end -ge 1 -and $out[$end - 1].TrimStart().StartsWith('<!-- FRAMEWORK-OWNED') -and -not $out[$end - 1].Contains('-->')) { $out.RemoveRange($end - 1, 2) }
+            }
+            $dropBlank = $true
+            continue
+        }
+        # Only the opening blockquote, above the first section, carries the template's description
+        # of the old layout; a consumer's own quotes further down are left alone.
+        if (-not ($inHeader -and $core.StartsWith('>'))) { $out.Add($line); continue }
+        if ($core.Contains('never in AGENTS.md') -and $core.Contains('mirror')) {
+            $out.Add('> **Framework rules** (Verification Rules, Leanness, SOLID, Agentic Workflow) are in [.github/instructions/framework-rules.instructions.md](./.github/instructions/framework-rules.instructions.md). If your agent has not already loaded that file, read it before planning or editing.' + $cr)
+            continue
+        }
+        $out.Add($core.Replace(' and imports the framework rules below.', '. Edit it here; `CLAUDE.md` only imports it for Claude Code.').Replace('CLAUDE.md wins on any conflict', 'AGENTS.md wins on any conflict').Replace('CLAUDE.md is for repo-shared conventions only', 'AGENTS.md is for repo-shared conventions only') + $cr)
+    }
+    return ($out -join [string][char]10)
+}
+
+# Claude Code honours `@AGENTS.md` inline as well as on its own line. Any such mention counts as
+# already migrated: declining the move can never lose text, and the checks still flag a banner.
+$agentsImportPattern = '(?<![\w/.@-])@(\./)?AGENTS\.md(?![\w-])'
+
+# The retired mirror always opened with this banner line; prose elsewhere that mentions generated
+# files is a consumer's own text, not the mirror.
+function Test-RetiredMirrorText {
+    param([string]$Text)
+    $first = @(($Text.TrimStart([char]0xFEFF)) -split '\r?\n' | Where-Object { $_.Trim() -ne '' } | Select-Object -First 1)
+    return ($first.Count -eq 1 -and $first[0].StartsWith('<!-- GENERATED FILE', [StringComparison]::Ordinal))
+}
+
+$layoutMove = $null
+$layoutMessage = $null
+if ($updateMode) {
+    $claudeTarget = Get-ContainedTargetPath -Relative 'CLAUDE.md'
+    $agentsTarget = Get-ContainedTargetPath -Relative 'AGENTS.md'
+    $claudeEntry = Get-Item -Force -LiteralPath $claudeTarget -ErrorAction SilentlyContinue
+    if ($claudeEntry -and -not $claudeEntry.PSIsContainer -and -not (Get-ReparsePointAncestor -Path $claudeTarget)) {
+        try {
+            $claudeBytes = [IO.File]::ReadAllBytes($claudeTarget)
+            $claudeHasBom = $claudeBytes.Length -ge 3 -and $claudeBytes[0] -eq 0xEF -and $claudeBytes[1] -eq 0xBB -and $claudeBytes[2] -eq 0xBF
+            $claudeText = [Text.UTF8Encoding]::new($false, $true).GetString($claudeBytes)
+            if ($claudeHasBom) { $claudeText = $claudeText.Substring(1) }
+        } catch { $claudeText = $null }
+        if ($null -eq $claudeText) {
+            $layoutMessage = 'LAYOUT: CLAUDE.md could not be read as UTF-8, so the instruction-layout move was not attempted. Move its content into AGENTS.md by hand (docs/upgrade-checklist.md).'
+        } elseif ($claudeText -cnotmatch $agentsImportPattern) {
+            $agentsEntry = Get-Item -Force -LiteralPath $agentsTarget -ErrorAction SilentlyContinue
+            $agentsIsMirror = $false
+            if ($agentsEntry -and -not $agentsEntry.PSIsContainer -and -not (Get-ReparsePointAncestor -Path $agentsTarget)) {
+                try { $agentsIsMirror = Test-RetiredMirrorText -Text ([IO.File]::ReadAllText($agentsTarget)) } catch { $agentsIsMirror = $false }
+            }
+            if (-not $agentsEntry -or $agentsIsMirror) {
+                $layoutMove = [pscustomobject]@{
+                    AgentsText = ConvertTo-AgentsInstructionText -Text $claudeText
+                    HasBom = $claudeHasBom
+                    BackupAgents = [bool]$agentsEntry
+                }
+                foreach ($relative in @('.claude/framework-update-backup/instruction-files/CLAUDE.md', 'CLAUDE.md', 'AGENTS.md')) { [void](Add-PlannedWrite -Relative $relative) }
+                if ($layoutMove.BackupAgents) { [void](Add-PlannedWrite -Relative '.claude/framework-update-backup/instruction-files/AGENTS.md') }
+                $layoutMessage = 'LAYOUT: moving the project instructions from CLAUDE.md into AGENTS.md (replacing the generated mirror) and writing the CLAUDE.md import stub; both originals, including any hand edits to the mirror, go to .claude/framework-update-backup/instruction-files/. Review AGENTS.md before committing.'
+            } else {
+                $layoutMessage = 'LAYOUT: AGENTS.md is not the retired generated mirror, so CLAUDE.md and AGENTS.md were left as they are. Merge CLAUDE.md into AGENTS.md by hand and make CLAUDE.md the two-import stub (docs/upgrade-checklist.md).'
+            }
+        }
+    }
+}
+
+$settingsBackupRelative = $null
+$settingsBackupKept = $false
+if ($updateMode -and (Test-Path -LiteralPath (Join-Path $tgt '.claude/settings.json') -PathType Leaf)) {
+    # Settings equal to one of this framework's own variants (line endings aside: a core.autocrlf checkout
+    # rewrites them) were written by an earlier run of this update; saving them again would replace the
+    # consumer's settings in the existing backup. Unreadable settings are backed up as before.
+    try { $currentSettings = Get-LfSha256 -Bytes ([IO.File]::ReadAllBytes((Join-Path $tgt '.claude/settings.json'))) }
+    catch { $currentSettings = $null }
+    $shippedSettings = @(foreach ($variant in '.claude/settings.json', '.claude/settings.windows.json') {
+        $shippedPath = Join-Path $src $variant
+        if (Test-Path -LiteralPath $shippedPath -PathType Leaf) { Get-LfSha256 -Bytes ([IO.File]::ReadAllBytes($shippedPath)) }
+    })
+    if ($currentSettings -and ($shippedSettings -ccontains $currentSettings) -and
+        (Test-Path -LiteralPath (Join-Path $tgt '.claude/.state/settings.json.pre-update') -PathType Leaf)) {
+        $settingsBackupKept = $true
+    } else {
+        $settingsBackupRelative = '.claude/.state/settings.json.pre-update'
+        [void](Add-PlannedWrite -Relative $settingsBackupRelative)
+    }
+}
+
+# Which shipped paths do the target's own ignore rules hide? A plain check-ignore never reports a
+# tracked path, and shipped paths hold no glob characters, so it reads them literally. Paths go as
+# arguments: Windows PowerShell appends a CR to lines piped to --stdin. $null: Git could not answer;
+# $script:IgnoreUnanswered then says whether that happened inside a work tree.
+$script:IgnoreUnanswered = $false
+function Get-IgnoredShippedPaths {
+    $git = @(Get-Command git -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1)
+    $routed = @(@('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE') | Where-Object { [Environment]::GetEnvironmentVariable($_, 'Process') }).Count -gt 0
+    if ($git.Count -eq 0 -or $routed) { return $null }
+    $gitPath = [string]$git[0].Source
+    $inside = Invoke-GitText -GitPath $gitPath -Arguments @('-C', $tgt, 'rev-parse', '--is-inside-work-tree')
+    if (-not ($inside.Started -and $inside.ExitCode -eq 0 -and $inside.Output -ceq 'true')) { return $null }
+    $query = $null
+    if (@($incomingPaths | Where-Object { $_ -match '[\[\]*?]' }).Count -eq 0) {
+        $query = Invoke-GitText -GitPath $gitPath -Arguments (@('-C', $tgt, 'check-ignore', '--') + $incomingPaths)
+    }
+    if ($null -eq $query -or -not $query.Started -or $query.ExitCode -notin @(0, 1)) { $script:IgnoreUnanswered = $true; return $null }
+    # The comma keeps "nothing ignored" an empty array; returned bare it would arrive as $null.
+    return , @($query.Output -split "`n" | Where-Object { $_ -cin $incomingPaths })
+}
+$ignoredShippedPaths = Get-IgnoredShippedPaths
+# A colliding original the consumer had gitignored is one developer's file and may hold a key. Its
+# archive stays out of Git through docs/pre-adoption/.gitignore, written before the first move.
+$keptOutEntries = @()
+if ($adoptMode -and $null -ne $ignoredShippedPaths) {
+    $keptOutEntries = @($archivePlan | Where-Object { $_.OriginalRelative -cin $ignoredShippedPaths })
+}
+$archiveIgnoreRelative = 'docs/pre-adoption/.gitignore'
+if ($keptOutEntries.Count -gt 0) { [void](Add-PlannedWrite -Relative $archiveIgnoreRelative) }
+
+$adoptionMarkerRelative = $null
+if ($adoptMode) { $adoptionMarkerRelative = '.claude/adoption-pending.json'; [void](Add-PlannedWrite -Relative $adoptionMarkerRelative) }
+$modeName = if ($updateMode) { 'update' } elseif ($adoptMode) { 'brownfield' } else { 'greenfield' }
+if ($layoutMessage) { Write-Output "  $layoutMessage" }
+Write-Output "OPERATION-PLAN schema=1 mode=$modeName"
+foreach ($category in @(
+    [pscustomobject]@{ Name = 'create'; Values = $createPlan },
+    [pscustomobject]@{ Name = 'replace'; Values = $replacePlan },
+    [pscustomobject]@{ Name = 'preserve'; Values = $preservePlan },
+    [pscustomobject]@{ Name = 'archive'; Values = @($archivePlan | ForEach-Object { $_.Relative }) },
+    [pscustomobject]@{ Name = 'delete'; Values = @($deletePlan) + @($skillDeletePlan) }
+)) {
+    foreach ($relative in @($category.Values | Sort-Object -Unique)) { Write-Output "PLAN $($category.Name) $relative" }
+}
+if ($WhatIf) { Write-Output 'Dry run complete; target was not modified.'; exit 0 }
+
+# Freeze every brownfield candidate's raw pre-move identity and provenance BEFORE the first move.
+# A read failure here is an examination failure, not an empty inventory: stop before mutating.
+$archiveEvidence = New-Object System.Collections.Generic.List[object]
+$archiveBaselineRevision = $null
+$archiveInventoryIdentity = $null
+$archiveInventoryComplete = $true
+if ($adoptMode) {
+    $archiveBaselineRevision = Get-AdoptionArchiveBaselineRevision
+    foreach ($entry in $archivePlan) {
+        try {
+            $archiveEvidence.Add((New-AdoptionArchiveEvidence -OriginalRelative $entry.OriginalRelative -DestinationRelative $entry.Relative))
+        } catch {
+            [Console]::Error.WriteLine("ERROR: Refusing brownfield install: could not capture pre-move evidence for '$($entry.OriginalRelative)': $($_.Exception.Message)")
+            exit 3
+        }
+    }
+    $archiveInventoryIdentity = New-AdoptionInventoryIdentity -Entries $archiveEvidence.ToArray()
+}
+
+function Write-AdoptionMarker {
+    param([Parameter(Mandatory = $true)][bool]$InventoryComplete)
+    $marker = [ordered]@{
+        installedAt       = (Get-Date).ToString('yyyy-MM-dd')
+        detectedArtifacts = $detected
+        # Legacy readers see only completed moves. The complete frozen inventory lives in
+        # archiveIntegrity.entries from before the first mutation.
+        archivedOriginals = @($archiveEvidence | Where-Object { $_.verified } | ForEach-Object { [string]$_.destination })
+        archiveIntegrity  = [ordered]@{
+            schemaVersion   = 1
+            inventoryStatus = $(if ($InventoryComplete) { 'complete' } else { 'failed' })
+            # baselineRevision is the committed-install HEAD (the pre-install revision) — an
+            # immutable anchor for the whole inventory. Each entry's own provenanceRevision is the
+            # commit that last touched THAT original path, used to attribute its author/history.
+            baselineRevision = $archiveBaselineRevision
+            capturedAt      = (Get-Date).ToString('yyyy-MM-dd')
+            entries         = @($archiveEvidence | ForEach-Object { [pscustomobject]$_ })
+            inventoryIdentity = $archiveInventoryIdentity
+        }
+        nextStep          = '/adopt - a developer types it in a session, OR an agent runs it headless (read .claude/commands/adopt.md and follow its Headless mode, or use .github/prompts/adopt.prompt.md with a --headless directive). Headless prepares an adopt-ai-framework PR branch for human review; it does not auto-merge discovered content.'
+        _comment          = 'Written by the framework installer because pre-existing AI tooling was detected. Consolidate it with /adopt - NOT /bootstrap. /adopt keeps this marker through archive and merge work, verifies and copies it for recovery, deletes it only immediately before the Phase-7 bootstrap, and restores it if completion fails.'
+    }
+    $markerPath = Join-Path $tgt '.claude/adoption-pending.json'
+    $markerParent = Split-Path -Parent $markerPath
+    New-Item -ItemType Directory -Force -Path $markerParent | Out-Null
+    $temporary = Join-Path $markerParent ('.adoption-pending-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    $backup = Join-Path $markerParent ('.adoption-pending-' + [guid]::NewGuid().ToString('N') + '.bak')
+    try {
+        [IO.File]::WriteAllText($temporary, ($marker | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
+        if (Test-Path -LiteralPath $markerPath -PathType Leaf) {
+            [IO.File]::Replace($temporary, $markerPath, $backup)
+        } else {
+            Move-Item -LiteralPath $temporary -Destination $markerPath
+        }
+    } finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+$archiveEvidenceByDest = @{}
+foreach ($ev in $archiveEvidence) { $archiveEvidenceByDest[[string]$ev.destination] = $ev }
+if ($adoptMode) {
+    # Persist the complete frozen inventory before the first source/archive mutation. If this
+    # write cannot happen, do not begin a move whose provenance receipt could be lost.
+    try {
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent (Join-Path $tgt '.claude/adoption-pending.json')) | Out-Null
+        Write-AdoptionMarker -InventoryComplete $true
+    } catch {
+        [Console]::Error.WriteLine("ERROR: Refusing brownfield install: could not persist the complete pre-move archive inventory: $($_.Exception.Message)")
+        exit 3
+    }
+}
+if ($keptOutEntries.Count -gt 0) {
+    # Written before any move, so an interrupted run never leaves a committable archive behind.
+    try {
+        $archiveIgnorePath = Get-ContainedTargetPath -Relative $archiveIgnoreRelative
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $archiveIgnorePath) | Out-Null
+        $archiveIgnoreText = if (Test-Path -LiteralPath $archiveIgnorePath -PathType Leaf) { [IO.File]::ReadAllText($archiveIgnorePath) } else { '' }
+        $archiveIgnoreLines = @($archiveIgnoreText -split '\r?\n')
+        $archiveIgnoreNew = @($keptOutEntries | ForEach-Object { '/' + $_.OriginalRelative } | Where-Object { $_ -cnotin $archiveIgnoreLines })
+        if ($archiveIgnoreNew.Count -gt 0) {
+            $separator = if ($archiveIgnoreText.Length -gt 0 -and -not $archiveIgnoreText.EndsWith("`n")) { "`n" } else { '' }
+            [IO.File]::AppendAllText($archiveIgnorePath, $separator + ($archiveIgnoreNew -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
+        }
+    } catch {
+        [Console]::Error.WriteLine("ERROR: Refusing brownfield install: could not write $archiveIgnoreRelative before archiving gitignored originals: $($_.Exception.Message)")
+        exit 3
+    }
+}
+foreach ($entry in $archivePlan) {
+    try {
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $entry.Destination) | Out-Null
+        Move-Item -LiteralPath $entry.Original -Destination $entry.Destination
+    } catch {
+        $archiveInventoryComplete = $false
+        try { if ($adoptMode) { Write-AdoptionMarker -InventoryComplete $false } } catch { [Console]::Error.WriteLine("ERROR: Could not update the frozen archive inventory after move failure: $($_.Exception.Message)") }
+        [Console]::Error.WriteLine("ERROR: Brownfield archive move failed for '$($entry.OriginalRelative)' -> '$($entry.Relative)': $($_.Exception.Message)")
+        [Console]::Error.WriteLine('  The complete pre-move inventory was written before archive mutation; originals not yet moved are untouched. Recover manually, then re-run.')
+        exit 3
+    }
+    $ev = $archiveEvidenceByDest[[string]$entry.Relative]
+    $movedBytes = $null
+    try { $movedBytes = [IO.File]::ReadAllBytes($entry.Destination) } catch { $movedBytes = $null }
+    $verdict = 'CANT-VERIFY'
+    if ($null -ne $movedBytes) {
+        $verdict = if ([int64]$movedBytes.LongLength -eq [int64]$ev.byteLength -and (Get-Sha256Hex -Bytes $movedBytes) -ceq [string]$ev.sha256) { 'PASS' } else { 'CORRUPTION' }
+    }
+    if ($verdict -eq 'PASS') {
+        $ev.verified = $true
+        $archived += $entry.Relative
+        try { if ($adoptMode) { Write-AdoptionMarker -InventoryComplete $true } } catch {
+            [Console]::Error.WriteLine("ERROR: Archive '$($entry.OriginalRelative)' passed byte verification but progress could not be persisted: $($_.Exception.Message)")
+            [Console]::Error.WriteLine('  The earlier frozen inventory remains on disk with this entry unverified; do not continue or rebaseline it.')
+            exit 3
+        }
+        Write-Output "  archived: $($entry.OriginalRelative) -> $($entry.Relative) (pre/post-move bytes verified)"
+    } else {
+        $archiveInventoryComplete = $false
+        if ($adoptMode) { Write-AdoptionMarker -InventoryComplete $false }
+        [Console]::Error.WriteLine("ERROR: Brownfield archive integrity check failed for '$($entry.OriginalRelative)' -> '$($entry.Relative)': $verdict.")
+        [Console]::Error.WriteLine("  Verified moves before the failure: $(if ($archived.Count) { $archived -join ', ' } else { '(none)' }).")
+        [Console]::Error.WriteLine('  Nothing was rolled back, re-hashed, or overwritten; originals not yet moved are untouched. Recover the archives manually, then re-run.')
+        exit 3
+    }
+}
+# Stop at the first failed delete, before any copy, and put back what this run already deleted: the
+# tree is then unchanged (a Git target stays clean) and the old ownership manifest, the deletion
+# authority, is still there, so a plain re-run finishes the job.
+$retiredDeleted = New-Object System.Collections.Generic.List[object]
+foreach ($relative in $deletePlan) {
+    $retiredPath = Get-ContainedTargetPath -Relative $relative
+    try {
+        $retiredBytes = [IO.File]::ReadAllBytes($retiredPath)
+        Remove-Item -Force -LiteralPath $retiredPath -ErrorAction Stop
+    } catch {
+        [Console]::Error.WriteLine("ERROR: Could not delete retired framework file '$relative': $($_.Exception.Message)")
+        $notRestored = 0
+        foreach ($done in $retiredDeleted) {
+            try { [IO.File]::WriteAllBytes($done.Path, $done.Bytes) }
+            catch {
+                $notRestored++
+                [Console]::Error.WriteLine("  Deleted and could not be put back: '$($done.Relative)': $($_.Exception.Message). Restore it from Git (git checkout -- <path>) before re-running.")
+            }
+        }
+        if (-not $notRestored) { [Console]::Error.WriteLine('  Any retired file this run had already deleted was put back with its original content.') }
+        [Console]::Error.WriteLine('  Resolve the cause above, then re-run the installer.')
+        exit 3
+    }
+    $retiredDeleted.Add([pscustomobject]@{ Relative = $relative; Path = $retiredPath; Bytes = $retiredBytes })
+}
+foreach ($done in $retiredDeleted) { Write-Output "  retired: $($done.Relative)" }
+if ($settingsBackupRelative) {
+    $settingsBackup = Get-ContainedTargetPath -Relative $settingsBackupRelative
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $settingsBackup) | Out-Null
+    Copy-Item -Force -LiteralPath (Join-Path $tgt '.claude/settings.json') -Destination $settingsBackup
+    Write-Output "  saved pre-update settings: $settingsBackupRelative"
+} elseif ($settingsBackupKept) {
+    Write-Output '  kept the earlier pre-update settings backup: .claude/.state/settings.json.pre-update (.claude/settings.json is already this framework''s own).'
+}
+if ($skillBackupPlan.Count -gt 0) {
+    $backupIncomplete = Get-ContainedTargetPath -Relative $backupIncompleteRelative
+    $backupAt = $backupIncompleteRelative
+    try {
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $backupIncomplete) | Out-Null
+        [IO.File]::WriteAllText($backupIncomplete, "This skill backup is unfinished; the next framework update takes it again.`n")
+        foreach ($entry in $skillBackupPlan) {
+            $backupAt = '.claude/skills/' + $entry.Relative.Substring('.claude/framework-update-backup/skills/'.Length)
+            $destination = Get-ContainedTargetPath -Relative $entry.Relative
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
+            Copy-Item -Force -LiteralPath $entry.Source -Destination $destination -ErrorAction Stop
+        }
+        $backupAt = $backupIncompleteRelative
+        Remove-Item -Force -LiteralPath $backupIncomplete -ErrorAction Stop
+    } catch {
+        [Console]::Error.WriteLine("ERROR: Could not finish the one-time skill backup at '$backupAt': $($_.Exception.Message)")
+        [Console]::Error.WriteLine('  No skill was overwritten, and the next run takes the backup again. Resolve the cause above (usually a program holding a file open), then re-run the installer; in a Git target add -AllowDirtyTree, since the changes Git now shows are this run''s own.')
+        exit 3
+    }
+}
+foreach ($entry in $disabledCarryPlan) {
+    $destination = Get-ContainedTargetPath -Relative $entry.Relative
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
+    Copy-Item -Force -LiteralPath $entry.Source -Destination $destination
+}
+foreach ($relative in $ordinaryApplyPaths) {
+    $destination = Get-ContainedTargetPath -Relative $relative
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
+    Copy-Item -Force -LiteralPath (Join-Path $src $relative) -Destination $destination
+}
+foreach ($entry in $disabledIncomingPlan) {
+    $destination = Get-ContainedTargetPath -Relative $entry.Relative
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
+    Copy-Item -Force -LiteralPath (Join-Path $src $entry.Source) -Destination $destination
+}
+foreach ($name in $skillExemplars.Keys) {
+    $base = if ($disabledSkillNames.Contains($name)) { ".claude/disabled-skills/$name" } else { ".claude/skills/$name" }
+    $newFile = Join-Path $tgt "$base/SKILL.md"
+    if (Test-Path -LiteralPath $newFile -PathType Leaf) {
+        $newText = [Text.UTF8Encoding]::new($false, $true).GetString([IO.File]::ReadAllBytes($newFile))
+        $newText = [regex]::Replace($newText, '(?m)^For a concrete current instance in this repo, see .+\r?\n?', '')
+        Set-Content -LiteralPath $newFile -Value ($newText.TrimEnd() + "`n`n" + $skillExemplars[$name] + "`n") -Encoding UTF8
+    }
+}
+# A disabled skill's files are already carried to .claude/disabled-skills, so a folder that cannot be
+# removed leaves only its active copy to delete by hand. The steps after this one still run and the
+# update stops at the end; a re-run is no remedy, since a Git target is dirty by then and refuses it.
+$skillsLeftActive = New-Object System.Collections.Generic.List[string]
+foreach ($relative in $skillDeletePlan) {
+    $path = Get-ContainedTargetPath -Relative $relative
+    if (-not (Test-Path -LiteralPath $path)) { continue }
+    try { Remove-Item -Recurse -Force -LiteralPath $path -ErrorAction Stop }
+    catch {
+        [Console]::Error.WriteLine("ERROR: Could not remove the active copy of disabled skill '$relative': $($_.Exception.Message)")
+        [Console]::Error.WriteLine("  Its files are kept under .claude/disabled-skills/$(Split-Path -Leaf $relative); resolve the cause above (usually a program holding a file open), then delete $relative by hand.")
+        $skillsLeftActive.Add($relative)
+    }
+}
+if ($layoutMove) {
+    # Backups first, byte-for-byte; then AGENTS.md; the stub last, so an interrupted run leaves
+    # CLAUDE.md un-migrated and a re-run finds AGENTS.md no longer a mirror and stops.
+    $backupRoot = '.claude/framework-update-backup/instruction-files'
+    $backupDestination = Get-ContainedTargetPath -Relative "$backupRoot/CLAUDE.md"
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $backupDestination) | Out-Null
+    Copy-Item -Force -LiteralPath (Get-ContainedTargetPath -Relative 'CLAUDE.md') -Destination $backupDestination
+    if ($layoutMove.BackupAgents) {
+        Copy-Item -Force -LiteralPath (Get-ContainedTargetPath -Relative 'AGENTS.md') -Destination (Get-ContainedTargetPath -Relative "$backupRoot/AGENTS.md")
+    }
+    [IO.File]::WriteAllText((Get-ContainedTargetPath -Relative 'AGENTS.md'), $layoutMove.AgentsText, [Text.UTF8Encoding]::new($layoutMove.HasBom))
+    Copy-Item -Force -LiteralPath (Join-Path $src 'CLAUDE.md') -Destination (Get-ContainedTargetPath -Relative 'CLAUDE.md')
+    Write-Output "  moved: CLAUDE.md -> AGENTS.md; CLAUDE.md is now the import stub (originals in $backupRoot/)."
+}
+if ($updateMode) {
+    $untouchedContent = @($protected | Where-Object { ($_ -ne $legalLicense -or -not $copyLegalLicense) -and -not ($layoutMove -and $_ -in @('CLAUDE.md', 'AGENTS.md')) })
+    Write-Output "  consumer-owned content files left untouched ($($untouchedContent -join ', '))."
+}
+
+if ($adoptMode) {
+    # Durable adoption marker: the SessionStart hook warns every new session, and docs-sync-check
+    # fails CI, until /adopt completes. It remains through archive and merge work, is verified and
+    # copied for recovery, then is removed only immediately before the Phase-7 bootstrap and
+    # restored if completion fails. Its archiveIntegrity block carries the frozen raw pre-move
+    # digests and provenance /adopt re-verifies across Phase 7.
+    Write-AdoptionMarker -InventoryComplete $archiveInventoryComplete
+}
+
+# Claude Code hooks default to pwsh (PowerShell 7). If it isn't installed, fall back to the Windows
+# PowerShell 5.1 variant (preinstalled on every Windows box) so the hooks still fire. Reuse that
+# resolved host in the printed follow-up commands; guidance must not name an unavailable executable.
+if (-not $pwshAvailable) {
+    $sj  = Join-Path $tgt '.claude/settings.json'
+    $sjw = Join-Path $tgt '.claude/settings.windows.json'
+    if ((Test-Path -LiteralPath $sjw) -and (Test-Path -LiteralPath $sj)) {
+        Copy-Item -Force -LiteralPath $sjw -Destination $sj
+        Write-Output "  pwsh not found - activated Windows PowerShell 5.1 hooks (settings.windows.json -> settings.json)."
+    }
+}
+
+Write-Output ""
+Write-Output "Each developer should run  $followUpPowerShell scripts/framework-doctor.ps1  once on their own machine."
+# Framework files the consumer's own rules ignore would be left out of the commit, so teammates would
+# never get them. Asked again now: the install may have replaced the rule (a consumer .claude/.gitignore).
+# The audit log is ignored on purpose (it is per-machine state).
+$script:IgnoreUnanswered = $false
+$ignoredAfterCopy = Get-IgnoredShippedPaths
+$hiddenShipped = @($ignoredAfterCopy | Where-Object { $_ -and $_ -notin $persistentCopyIfAbsent })
+if ($hiddenShipped.Count -gt 0) {
+    $hiddenSummary = @($hiddenShipped | Group-Object { if ($_.Contains('/')) { $_.Split('/')[0] + '/' } else { $_ } } | Sort-Object Name |
+        ForEach-Object { if ($_.Count -gt 1) { "$($_.Name) ($($_.Count) files)" } else { $_.Group[0] } }) -join ', '
+    Write-Output "WARNING: your ignore rules hide $($hiddenShipped.Count) of the framework's own files, so committing this install leaves them out and teammates will not get them: $hiddenSummary. Add exceptions for them to .gitignore before committing."
+} elseif ($script:IgnoreUnanswered) {
+    Write-Output "NOTE: Git could not say whether your ignore rules hide any of the framework's files; check git status --ignored before committing."
+}
+if ($skillsLeftActive.Count -gt 0) {
+    [Console]::Error.WriteLine('  Every other step of this update is done. After deleting what is named above, continue with docs/upgrade-checklist.md.')
+    exit 3
+}
+if ($updateMode) {
+    Write-Output "Done (update). Framework-owned machinery refreshed; the listed protected paths were left untouched; .claude/settings.json was backed up and refreshed."
+    Write-Output "  Reconcile protected rules and verify the update with docs/upgrade-checklist.md."
+    Write-Output "  Next: review the diff, run  $followUpPowerShell scripts/docs-sync-check.ps1 , then commit."
+} elseif ($adoptMode) {
+    # Say what the consumer will find: only colliding files move; other tooling stays in place.
+    $moved = @($archivePlan | ForEach-Object { $_.OriginalRelative })
+    $leftInPlace = @($detected | Where-Object { $_ -notin $moved })
+    Write-Output "Done - but this repo is NOT ready for AI-assisted work yet: it has pre-existing AI"
+    Write-Output "tooling that must be consolidated with /adopt; .claude/adoption-pending.json records the inventory."
+    if ($moved.Count -gt 0) { Write-Output "Moved to docs/pre-adoption/ (this install would have overwritten them): $($moved -join ', ')" }
+    if ($leftInPlace.Count -gt 0) { Write-Output "Left where they were: $($leftInPlace -join ', ')" }
+    if ($keptOutEntries.Count -gt 0) { Write-Output "Kept out of Git - you had gitignored these, and they may hold secrets: $(@($keptOutEntries | ForEach-Object { $_.OriginalRelative }) -join ', '). $archiveIgnoreRelative lists their archives; keep per-developer settings in files Git ignores, such as .claude/settings.local.json." }
+    # Without Git's answer an archived original may still be one you had gitignored.
+    if ($moved.Count -gt 0 -and $null -eq $ignoredShippedPaths) { Write-Output "Some may be files you had gitignored: check docs/pre-adoption/ for secrets before committing." }
+    Write-Output ""
+    Write-Output "Next steps in the target repo:"
+    Write-Output "  1. Review and commit the copied files (they are team-shared config, not local settings)."
+    Write-Output "  2. A DEVELOPER must start a Claude Code session in the target repo and type:  /adopt"
+    Write-Output "     - /adopt is developer-initiated: AI agents and the model CANNOT invoke it, and it"
+    Write-Output "       only exists inside a session started in the target repo."
+    Write-Output "     - Do NOT run /bootstrap instead - it would skip the archive/merge/provenance flow."
+    Write-Output "       The SessionStart hook and docs-sync-check flag this"
+    Write-Output "       repo until /adopt has run."
+    Write-Output ""
+    Write-Output "  IF YOU ARE AN AI AGENT running this installer: your task is NOT complete until you"
+    Write-Output "  have done step 1 (commit the copied files) and then EITHER told the developer to start a"
+    Write-Output "  Claude Code session in the target repo and type /adopt, OR run headless adoption yourself:"
+    Write-Output "  invoke the adopt workflow with a --headless directive (use .github/prompts/adopt.prompt.md,"
+    Write-Output "  or read .claude/commands/adopt.md and follow its 'Headless mode'). Headless adoption"
+    Write-Output "  PREPARES a PR: it creates the adopt-ai-framework branch, archives and screens the"
+    Write-Output "  originals, and STAGES every AGENTS.md/TECH_DEBT merge for a human to review - it does NOT"
+    Write-Output "  apply untrusted discovered content and does NOT open or merge the PR, so a person still"
+    Write-Output "  approves the staged changes. Do not replicate it by hand - run the real workflow (headless)"
+    Write-Output "  or hand off to a developer. Report whichever you did as the next step in your final summary."
+} else {
+    Write-Output "Done. Next steps in the target repo:"
+    Write-Output "  1. Review and commit the copied files (they are team-shared config, not local settings)."
+    Write-Output "  2. A DEVELOPER must start a Claude Code session in the target repo and type:  /bootstrap"
+    Write-Output "     - /bootstrap is developer-initiated: AI agents and the model CANNOT invoke it, and it"
+    Write-Output "       only exists inside a session started in the target repo."
+    Write-Output "  3. Until /bootstrap has run, docs-sync-check FAILS by design - that is expected at this"
+    Write-Output "     stage, not a defect to fix. After it has run, verify:  $followUpPowerShell scripts/docs-sync-check.ps1"
+    Write-Output "  4. Review the generated AGENTS.md - it is canonical; CLAUDE.md only imports it (see docs/enforcement-surfaces.md)."
+    Write-Output ""
+    Write-Output "  IF YOU ARE AN AI AGENT running this installer: your task is NOT complete until you"
+    Write-Output "  have done step 1 and then told the developer, explicitly, to start a Claude Code"
+    Write-Output "  session in the target repo and type /bootstrap. Report that as the required manual next"
+    Write-Output "  step in your final summary. Do not attempt /bootstrap yourself or replicate it by hand."
+}
+exit 0

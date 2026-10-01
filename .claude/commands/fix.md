@@ -1,0 +1,42 @@
+---
+description: "Bug-fix workflow: diagnose and reproduce first, use a red regression test when an evidenced harness exists, apply the minimal fix, and Boy Scout the blast radius only. Invoke for bugs, crashes, failing tests, and regressions."
+argument-hint: "[bug description or failing test]"
+---
+
+Diagnose and fix a bug in this repository. Derive its applicable technologies and validation from repository evidence; do not infer Java from this framework distribution. Every decision must comply with the conventions and patterns in AGENTS.md.
+
+## Input
+$ARGUMENTS
+
+## Execution
+
+### Step 1 — Diagnose
+- Read the relevant code and any existing tests
+- Identify the root cause — not just the symptom
+- Determine the blast radius (what other code could be affected?)
+- State the root cause and your fix strategy before writing code
+
+### Step 2 — Reproduce before fixing
+Before touching production code, derive the repository's applicable test harness and validation commands from AGENTS.md, committed CI, scripts, manifests, and configuration.
+- When an applicable harness exists, write a regression test that reproduces the bug and confirm it fails for the right reason before the fix. This test becomes the proof that the fix works.
+- When no applicable harness or test command exists, reproduce the bug with the strongest evidenced validation, report tests as **not available**, and do not introduce a foreign harness solely for this fix.
+
+### Step 3 — Fix
+- Every edit must be necessary for the requested behaviour, compatibility with existing callers or extension points, or meaningful verification. A necessary fix may extend beyond its original hunk.
+- Explicitly requested cleanup/refactoring remains allowed. A touched file alone does not authorize unrelated logging or cleanup, and deferred unrelated work needs no TODO.
+- If public/protected signatures or virtual/override behaviour change, check existing callers and extension compatibility. Identify an unrequested incompatibility; an explicitly requested addition or break remains valid.
+
+### Step 4 — Verify
+Derive exact regression and related-suite commands plus applicable **build**, **test**, **format**, **lint**, **migration/deploy**, and **data-validation** commands from `AGENTS.md`, committed CI, scripts, manifests, and configuration. Run only commands supported by that evidence for the changed area; a Java profile establishes only profile applicability, so use any command, project, configuration, runner, or flags only when that exact full form is explicitly recorded in the evidence. The regression test must pass and nothing else should break. Record each unavailable category as **not available**.
+
+### Step 5 — Boy Scout (outcome-bound)
+Apply only the Boy Scout work permitted by Step 3. Do not boy-scout unrelated files in a bug fix.
+
+### Step 6 — Wrap up
+@.claude/workflow.md
+
+### Step 7 — Report
+- Root cause: what was wrong and why
+- Fix: what you changed
+- Regression test or strongest validation: what reproduced the bug and what verifies the fix (or why tests are **not available**)
+- Blast radius: what else was affected

@@ -1,0 +1,46 @@
+{
+  "_comment": "Windows-only local Copilot hook registration. Every command explicitly invokes PowerShell 7; Copilot coding-agent cloud hook execution is unsupported. agentStop firing remains unverified, so boy-scout-check queues advisory findings for the observed userPromptSubmitted delivery leg. boy-scout-check never blocks. Exactly one userPromptSubmitted hook composes routing, plan-gate, security salience, and any queued Boy Scout nudge. The per-tool matcher is intentionally omitted because Copilot write-tool names vary; guard.ps1 self-filters by path and content. See docs/enforcement-surfaces.md for the capability matrix.",
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "powershell": "pwsh -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\session-start.ps1",
+        "timeoutSec": 15
+      }
+    ],
+    "agentStop": [
+      {
+        "type": "command",
+        "powershell": "pwsh -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\boy-scout-check.ps1 -Mode scan",
+        "timeoutSec": 10
+      }
+    ],
+    "userPromptSubmitted": [
+      {
+        "type": "command",
+        "powershell": "pwsh -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\route-prompt.ps1",
+        "timeoutSec": 10
+      }
+    ],
+    "preToolUse": [
+      {
+        "type": "command",
+        "powershell": "pwsh -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\guard.ps1",
+        "timeoutSec": 10
+      }
+    ],
+    "postToolUse": [
+      {
+        "type": "command",
+        "powershell": "pwsh -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\post-write.ps1",
+        "timeoutSec": 120
+      },
+      {
+        "type": "command",
+        "powershell": "pwsh -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\audit-trail.ps1",
+        "timeoutSec": 10
+      }
+    ]
+  }
+}

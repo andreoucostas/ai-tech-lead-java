@@ -1,0 +1,472 @@
+﻿# bootstrap-baseline PowerShell behavioral tests: record a /bootstrap baseline, then report what a
+# later /rebootstrap must re-analyse. Every case builds its own throwaway Git repository.
+if (-not (Get-Command Invoke-Hook -ErrorAction SilentlyContinue)) { . (Join-Path $PSScriptRoot '_HookHarness.ps1') }
+$scripts = (Resolve-Path (Join-Path $PSScriptRoot '..\..\scripts')).Path
+$baselinePs = Join-Path $scripts 'bootstrap-baseline.ps1'
+$stateRel = '.claude/bootstrap-baseline.tsv'
+
+$claimRepo = 'Data access goes through OrderRepository for every order aggregate.'
+$claimDi = 'Services are registered in ServiceRegistration.addOrders during startup.'
+$claimCtl = 'Every API controller derives from ApiControllerBase.'
+$claimNoSql = 'No SQL migration scripts are checked in; schema changes ship through Liquibase changelogs.'
+
+function Put([string]$Path, [string]$Text) {
+    $dir = Split-Path $Path -Parent
+    if ($dir) { [IO.Directory]::CreateDirectory($dir) | Out-Null }
+    [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding($false)))
+}
+function G([string]$Root, [string[]]$GitArgs) {
+    $out = & git -C $Root -c user.name=test -c user.email=test@example.invalid -c init.defaultBranch=main @GitArgs 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "git $($GitArgs -join ' ') failed: $($out -join ' ')" }
+}
+function Agents([string[]]$Claims) {
+    "# Project`n`n## Conventions`n`n" + (($Claims | ForEach-Object { "- $_" }) -join "`n") + "`n"
+}
+function Fixture {
+    $r = Join-Path ([IO.Path]::GetTempPath()) ('baseline-' + [guid]::NewGuid())
+    [IO.Directory]::CreateDirectory($r) | Out-Null
+    Put (Join-Path $r 'framework-ownership.json') ('{ "schema-version": 1, "paths": [' +
+        '{ "path": "AGENTS.md", "ownership": "consumer-owned/protected" },' +
+        '{ "path": "framework-ownership.json", "ownership": "framework-owned/overwritten" },' +
+        '{ "path": "scripts/tool.ps1", "ownership": "framework-owned/overwritten" } ] }')
+    Put (Join-Path $r 'AGENTS.md') (Agents @($claimRepo, $claimDi, $claimCtl, $claimNoSql))
+    Put (Join-Path $r 'scripts/tool.ps1') "'framework'"
+    Put (Join-Path $r 'README.md') 'readme'
+    Put (Join-Path $r 'settings.gradle') "rootProject.name = 'orders'"
+    Put (Join-Path $r 'src/Orders/build.gradle') "plugins { id 'java' }"
+    Put (Join-Path $r 'src/Orders/Data/OrderRepository.java') 'class OrderRepository {}'
+    Put (Join-Path $r 'src/Orders/Api/ServiceRegistration.java') 'final class ServiceRegistration {}'
+    Put (Join-Path $r 'src/Orders/Api/Controllers/OrdersController.java') 'class OrdersController extends ApiControllerBase {}'
+    G $r @('init', '-q')
+    G $r @('add', '-A')
+    G $r @('commit', '-q', '-m', 'fixture')
+    $r
+}
+function Claim([string]$Pass, [string]$Kind, [string]$Text, [string[]]$Evidence) {
+    [ordered]@{ profile = 'java'; pass = $Pass; kind = $Kind; text = $Text; evidence = $Evidence }
+}
+function AllClaims {
+    @(
+        (Claim 'A2' 'scoped' $claimRepo @('src/Orders/Data/OrderRepository.java')),
+        (Claim 'A3' 'scoped' $claimDi @('src/Orders/Api/ServiceRegistration.java')),
+        (Claim 'A4' 'universal' $claimCtl @('src/Orders/Api/Controllers/*.java')),
+        (Claim 'A2' 'absence' $claimNoSql @('**/Migrations/*.sql'))
+    )
+}
+function ClaimsFile($Claims, [string[]]$Profiles = @('java')) {
+    $path = Join-Path ([IO.Path]::GetTempPath()) ('claims-' + [guid]::NewGuid() + '.json')
+    Put $path (ConvertTo-Json -Depth 6 -InputObject ([ordered]@{ profiles = $Profiles; claims = @($Claims) }))
+    $path
+}
+function Record([string]$Root, $Claims = (AllClaims)) {
+    $file = ClaimsFile $Claims
+    try { RunArg $baselinePs @('-Mode', 'Record', '-Root', $Root, '-ClaimsPath', $file) }
+    finally { Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue }
+}
+function Impact([string]$Root) { RunArg $baselinePs @('-Mode', 'Impact', '-Root', $Root) }
+function Recorded([string]$Root) {
+    $res = Record $Root
+    Assert ($res.Exit -eq 0) "record exit $($res.Exit): $($res.Out) $($res.Err)"
+}
+function Has($Result, [string]$Line) {
+    Assert ($Result.Out -match ('(?m)^' + [regex]::Escape($Line) + '\r?$')) "missing line '$Line' in: $($Result.Out) $($Result.Err)"
+}
+function HasNot($Result, [string]$Pattern) {
+    Assert ($Result.Out -notmatch $Pattern) "unexpected match '$Pattern' in: $($Result.Out)"
+}
+function ExitIs($Result, [int]$Expected) {
+    Assert ($Result.Exit -eq $Expected) "exit $($Result.Exit), expected $($Expected): $($Result.Out) $($Result.Err)"
+}
+function Drop([string]$Root) { Remove-Item -Recurse -Force -LiteralPath $Root -ErrorAction SilentlyContinue }
+function Relocate([string]$Root, [string]$From, [string]$To) {
+    $target = Join-Path $Root $To
+    [IO.Directory]::CreateDirectory((Split-Path $target -Parent)) | Out-Null
+    [IO.File]::Move((Join-Path $Root $From), $target)
+}
+function Hazards([string]$Root, [string]$Area) {
+    Put (Join-Path $Root 'FRAMEWORK-CONTEXT.md') ("# Context`n`n## Known Hazard Areas`n`n| Area / file(s) | Hazard | Status | Reviewed |`n" +
+        "|---|---|---|---|`n| $Area | Registration order is load-bearing. | [VERIFIED] | 2026-09-01 |`n`n## Shared Libraries`n")
+}
+
+Reset-Tests
+It 'fixture repository commits every fixture file' {
+    $r = Fixture
+    try {
+        $tracked = @(& git -C $r ls-files)
+        Assert ($tracked.Count -eq 9) "expected 9 tracked fixture files, got $($tracked.Count): $($tracked -join ', ')"
+    } finally { Drop $r }
+}
+It 'an unchanged repository stops before any re-analysis' {
+    $r = Fixture
+    try {
+        Recorded $r
+        Assert (Test-Path -LiteralPath (Join-Path $r $stateRel)) 'record did not write the baseline file'
+        $res = Impact $r
+        ExitIs $res 0; Has $res 'CHANGED-AREAS 0'; Has $res 'RESULT stop'
+        HasNot $res '(?m)^(PROFILE|CLAIM|RECHECK|EDITED) '
+        $state = [IO.File]::ReadAllText((Join-Path $r $stateRel))
+        Assert ($state -notmatch "[ \t]\n") 'a baseline row ends in whitespace an editor would strip'
+    } finally { Drop $r }
+}
+It 'a missing baseline asks for a full run and says it could not examine' {
+    $r = Fixture
+    try {
+        $res = Impact $r
+        ExitIs $res 3; Has $res 'RESULT full'
+        Assert ($res.Out -match '(?m)^BASELINE none .*cannot examine') "no cannot-examine baseline line: $($res.Out)"
+    } finally { Drop $r }
+}
+It 'a changed evidence file marks only its own claim affected' {
+    $r = Fixture
+    try {
+        Recorded $r
+        Put (Join-Path $r 'src/Orders/Data/OrderRepository.java') 'class OrderRepository { void Save() {} }'
+        G $r @('commit', '-q', '-am', 'change repository')
+        $res = Impact $r
+        ExitIs $res 0
+        Has $res 'AREA src/Orders/Data'
+        Has $res 'PROFILE java incremental affected=1/4 (25%) reason=none'
+        Assert ($res.Out -match '(?m)^CLAIM changed-evidence [0-9a-f]{12} java/A2: Data access goes through OrderRepository') "no changed-evidence line: $($res.Out)"
+        HasNot $res 'ServiceRegistration\.AddOrders'
+        Has $res 'RESULT incremental'
+    } finally { Drop $r }
+}
+It 'an uncommitted edit counts as a change' {
+    $r = Fixture
+    try {
+        Recorded $r
+        Put (Join-Path $r 'src/Orders/Api/ServiceRegistration.java') 'final class ServiceRegistration { static void addOrders() {} }'
+        $res = Impact $r
+        ExitIs $res 0
+        Assert ($res.Out -match '(?m)^CLAIM changed-evidence [0-9a-f]{12} java/A3: ') "uncommitted edit not seen: $($res.Out)"
+    } finally { Drop $r }
+}
+It 'framework-owned edits and a new version comment alone stop early' {
+    $r = Fixture
+    try {
+        Recorded $r
+        Put (Join-Path $r 'scripts/tool.ps1') "'framework v2'"
+        Put (Join-Path $r 'AGENTS.md') ("<!--`n  version: 2.0.0`n-->`n" + (Agents @($claimRepo, $claimDi, $claimCtl, $claimNoSql)))
+        G $r @('commit', '-q', '-am', 'framework update')
+        $res = Impact $r
+        ExitIs $res 0; Has $res 'CHANGED-AREAS 0'; Has $res 'RESULT stop'
+    } finally { Drop $r }
+}
+It 'a hand-edited claim is affected' {
+    $r = Fixture
+    try {
+        Recorded $r
+        Put (Join-Path $r 'AGENTS.md') (Agents @($claimRepo, 'Services are registered by assembly scanning.', $claimCtl, $claimNoSql))
+        $res = Impact $r
+        ExitIs $res 0
+        Assert ($res.Out -match '(?m)^CLAIM edited-or-removed [0-9a-f]{12} java/A3: Services are registered in ServiceRegistration') "edited claim not reported: $($res.Out)"
+        Has $res 'RESULT incremental'
+    } finally { Drop $r }
+}
+It 'a line added to AGENTS.md by hand is reported and blocks the early stop' {
+    $r = Fixture
+    try {
+        Recorded $r
+        Put (Join-Path $r 'AGENTS.md') (Agents @($claimRepo, $claimDi, $claimCtl, $claimNoSql, 'All domain services are sealed classes.'))
+        $res = Impact $r
+        ExitIs $res 0; Has $res 'CHANGED-AREAS 0'
+        Has $res 'EDITED - All domain services are sealed classes.'
+        Has $res 'RESULT incremental'
+        HasNot $res '(?m)^RECHECK '
+    } finally { Drop $r }
+}
+It 'a reworded claim that keeps its old sentence is reported as edited' {
+    $r = Fixture
+    try {
+        Recorded $r
+        Put (Join-Path $r 'AGENTS.md') (Agents @($claimRepo, $claimDi, ($claimCtl + ' Legacy controllers are exempt.'), $claimNoSql))
+        $res = Impact $r
+        ExitIs $res 0
+        Has $res "EDITED - $claimCtl Legacy controllers are exempt."
+        Has $res 'RESULT incremental'
+    } finally { Drop $r }
+}
+It 'every changed area is listed, however many' {
+    $r = Fixture
+    try {
+        Recorded $r
+        for ($i = 0; $i -lt 55; $i++) { Put (Join-Path $r "lib/Mod$i/Thing.java") "class Thing$i {}" }
+        $res = Impact $r
+        ExitIs $res 0; Has $res 'CHANGED-AREAS 55'
+        $listed = [regex]::Matches($res.Out, '(?m)^AREA lib/Mod[0-9]+\r?$').Count
+        Assert ($listed -eq 55) "expected 55 AREA lines, got $listed"
+    } finally { Drop $r }
+}
+It 'evidence that now matches no file is reported, not carried forward' {
+    $r = Fixture
+    try {
+        Recorded $r
+        G $r @('rm', '-q', 'src/Orders/Api/Controllers/OrdersController.java')
+        $res = Impact $r
+        ExitIs $res 0
+        Assert ($res.Out -match '(?m)^CLAIM no-evidence-match [0-9a-f]{12} java/A4: Every API controller') "dead evidence not reported: $($res.Out)"
+    } finally { Drop $r }
+}
+It 'a new file deep in a tree is reported at its depth-three area and rechecks universal and absence claims' {
+    $r = Fixture
+    try {
+        Recorded $r
+        Put (Join-Path $r 'src/Orders/Api/Controllers/Admin/Legacy/AdminController.java') 'class AdminController {}'
+        $res = Impact $r
+        ExitIs $res 0
+        Has $res 'CHANGED-AREAS 1'; Has $res 'AREA src/Orders/Api'
+        Has $res 'PROFILE java incremental affected=0/4 (0%) reason=none'
+        Assert ($res.Out -match '(?m)^RECHECK universal [0-9a-f]{12} java/A4: ') "universal claim not rechecked: $($res.Out)"
+        Assert ($res.Out -match '(?m)^RECHECK absence [0-9a-f]{12} java/A2: No SQL migration') "absence claim not rechecked: $($res.Out)"
+        HasNot $res '(?m)^CLAIM '
+    } finally { Drop $r }
+}
+It 'a file that now matches an absence claim makes it affected' {
+    $r = Fixture
+    try {
+        Recorded $r
+        Put (Join-Path $r 'db/Migrations/001_init.sql') 'create table t (id int);'
+        $res = Impact $r
+        ExitIs $res 0
+        Assert ($res.Out -match '(?m)^CLAIM changed-evidence [0-9a-f]{12} java/A2: No SQL migration') "absence claim not affected: $($res.Out)"
+    } finally { Drop $r }
+}
+It 'a new project manifest forces a full run of its profile' {
+    $r = Fixture
+    try {
+        Recorded $r
+        Put (Join-Path $r 'src/Billing/build.gradle') "plugins { id 'java' }"
+        $res = Impact $r
+        ExitIs $res 0
+        Has $res 'PROFILE java full affected=0/4 (0%) reason=manifest src/Billing/build.gradle'
+        Has $res 'RESULT full'
+        HasNot $res '(?m)^RECHECK '
+    } finally { Drop $r }
+}
+It 'a changed project manifest body alone does not force a full run' {
+    $r = Fixture
+    try {
+        Recorded $r
+        Put (Join-Path $r 'src/Orders/build.gradle') "plugins { id 'java-library' }"
+        $res = Impact $r
+        ExitIs $res 0
+        Has $res 'PROFILE java incremental affected=0/4 (0%) reason=none'
+    } finally { Drop $r }
+}
+It 'more than half of a profile claims affected forces a full run' {
+    $r = Fixture
+    try {
+        Recorded $r
+        Put (Join-Path $r 'src/Orders/Data/OrderRepository.java') 'changed 1'
+        Put (Join-Path $r 'src/Orders/Api/ServiceRegistration.java') 'changed 2'
+        Put (Join-Path $r 'src/Orders/Api/Controllers/OrdersController.java') 'changed 3'
+        $res = Impact $r
+        ExitIs $res 0
+        Has $res 'PROFILE java full affected=3/4 (75%) reason=threshold'
+        Has $res 'RESULT full'
+    } finally { Drop $r }
+}
+It 'record refuses a claim whose text is not in AGENTS.md and writes nothing' {
+    $r = Fixture
+    try {
+        $res = Record $r @((Claim 'A1' 'scoped' 'This sentence appears nowhere in the instructions.' @('README.md')))
+        ExitIs $res 1
+        Assert ($res.Out -match 'INVALID: .*not found in AGENTS\.md') "no invalid-claim message: $($res.Out)"
+        Assert (-not (Test-Path -LiteralPath (Join-Path $r $stateRel))) 'a refused record still wrote the baseline'
+    } finally { Drop $r }
+}
+It 'record refuses scoped evidence that matches no file' {
+    $r = Fixture
+    try {
+        $res = Record $r @((Claim 'A2' 'scoped' $claimRepo @('src/Orders/Data/Missing*.java')))
+        ExitIs $res 1
+        Assert ($res.Out -match 'INVALID: .*matches no file') "no dead-evidence message: $($res.Out)"
+    } finally { Drop $r }
+}
+It 'framework-owned files cannot be claim evidence' {
+    $r = Fixture
+    try {
+        $res = Record $r @((Claim 'A2' 'scoped' $claimRepo @('scripts/tool.ps1')))
+        ExitIs $res 1
+        Assert ($res.Out -match 'INVALID: .*matches no file') "framework-owned evidence was accepted: $($res.Out)"
+    } finally { Drop $r }
+}
+It 'record carries forward unlisted claims still in AGENTS.md and drops removed ones' {
+    $r = Fixture
+    try {
+        Recorded $r
+        Put (Join-Path $r 'AGENTS.md') (Agents @($claimRepo, $claimDi, $claimCtl))
+        $res = Record $r @((Claim 'A2' 'scoped' $claimRepo @('src/Orders/Data/OrderRepository.java')))
+        ExitIs $res 0
+        Has $res 'RECORDED claims=3 carried=2 unclaimed=0 profiles=java'
+        $state = [IO.File]::ReadAllText((Join-Path $r $stateRel))
+        Assert ([regex]::Matches($state, '(?m)^claim\t').Count -eq 3) "expected 3 claim rows: $state"
+        Assert ($state -notmatch 'No SQL migration') 'a claim removed from AGENTS.md was carried forward'
+        $after = Impact $r
+        ExitIs $after 0; Has $after 'RESULT stop'
+    } finally { Drop $r }
+}
+It 'a claim carried forward with evidence that had already changed is still reported' {
+    $r = Fixture
+    try {
+        Recorded $r
+        Put (Join-Path $r 'src/Orders/Api/ServiceRegistration.java') 'final class ServiceRegistration { static void addOrders() {} }'
+        G $r @('commit', '-q', '-am', 'change registration')
+        # A run that found the registration claim wrong but applied no change leaves it unlisted.
+        $res = Record $r @((Claim 'A2' 'scoped' $claimRepo @('src/Orders/Data/OrderRepository.java')))
+        ExitIs $res 0
+        $after = Impact $r
+        ExitIs $after 0; Has $after 'CHANGED-AREAS 0'
+        Assert ($after.Out -match '(?m)^CLAIM changed-evidence [0-9a-f]{12} java/A3: Services are registered') "a stale carried claim was not reported: $($after.Out)"
+        Has $after 'RESULT incremental'
+    } finally { Drop $r }
+}
+It 'a UTF-8 console with a byte-order mark still lets record and impact hash the tree' {
+    # Windows PowerShell 5.1 opens a child's redirected stdin with the console input encoding and writes
+    # its preamble first, so under a UTF-8 console git read a byte-order mark before the first path.
+    $r = Fixture
+    $previous = [Console]::InputEncoding
+    try {
+        try { [Console]::InputEncoding = New-Object Text.UTF8Encoding($true) } catch { }
+        $res = Record $r
+        ExitIs $res 0
+        $after = Impact $r
+        ExitIs $after 0; Has $after 'RESULT stop'
+    } finally {
+        try { [Console]::InputEncoding = $previous } catch { }
+        Drop $r
+    }
+}
+It 'record refuses a claim that is only part of a statement and names the whole statement' {
+    $r = Fixture
+    try {
+        $res = Record $r @((Claim 'A2' 'scoped' 'Data access goes through OrderRepository' @('src/Orders/Data/OrderRepository.java')))
+        ExitIs $res 1
+        Has $res "INVALID: claim 'Data access goes through OrderRepository' is not one whole statement; copy the whole statement: $claimRepo"
+    } finally { Drop $r }
+}
+It 'a baseline claim that is only part of a statement is reported and not carried forward' {
+    $r = Fixture
+    try {
+        Recorded $r
+        # A record made before whole statements were required could hold a fragment as a claim.
+        $state = Join-Path $r $stateRel
+        $partial = [IO.File]::ReadAllText($state).Replace("`tscoped`t$claimRepo`n", "`tscoped`tData access goes through OrderRepository`n")
+        Assert ($partial.Contains("`tscoped`tData access goes through OrderRepository`n")) 'fixture did not plant the partial claim'
+        Put $state $partial
+        $after = Impact $r
+        ExitIs $after 0
+        Assert ($after.Out -match '(?m)^CLAIM edited-or-removed [0-9a-f]{12} java/A2: Data access goes through OrderRepository\r?$') "a partial claim was treated as current: $($after.Out)"
+        Has $after 'RESULT incremental'
+        $res = Record $r @()
+        ExitIs $res 0
+        Has $res "UNCLAIMED $claimRepo"
+        Has $res 'RECORDED claims=3 carried=3 unclaimed=1 profiles=java'
+    } finally { Drop $r }
+}
+It 'record names each Conventions or Architecture Decisions statement no claim covers' {
+    $r = Fixture
+    try {
+        $extra = 'Every repository lookup returns an Optional instead of null.'
+        $adr = 'ADR-001 — Orders keep one aggregate per request — 2026-09-27'
+        Put (Join-Path $r 'AGENTS.md') ((Agents @($claimRepo, $claimDi, $claimCtl, $claimNoSql, $extra)) +
+            "`n### Verification Commands`n`n- build: ./gradlew build`n`n## Architecture Decisions`n`n- $adr`n`n## Common Tasks`n`n- add-endpoint: add an HTTP endpoint`n")
+        $res = Record $r
+        ExitIs $res 0
+        Has $res "UNCLAIMED $extra"
+        Has $res "UNCLAIMED $adr"
+        HasNot $res 'UNCLAIMED .*(gradlew build|add-endpoint)'
+        Has $res 'RECORDED claims=4 carried=0 unclaimed=2 profiles=java'
+    } finally { Drop $r }
+}
+It 'a file moved unchanged is followed, named for its hazard row and re-pointed by the next record' {
+    $r = Fixture
+    try {
+        Hazards $r '`src/Orders/Api/ServiceRegistration.java` (startup wiring)'
+        Recorded $r
+        Relocate $r 'src/Orders/Data/OrderRepository.java' 'src/Sales/Data/OrderRepository.java'
+        Relocate $r 'src/Orders/Api/ServiceRegistration.java' 'src/Orders/Startup/ServiceRegistration.java'
+        Relocate $r 'src/Orders/Api/Controllers/OrdersController.java' 'src/Orders/Api/Controllers/SalesController.java'
+        $res = Impact $r
+        ExitIs $res 0
+        Has $res 'RENAMED src/Orders/Api/ServiceRegistration.java -> src/Orders/Startup/ServiceRegistration.java'
+        Has $res 'RENAMED src/Orders/Data/OrderRepository.java -> src/Sales/Data/OrderRepository.java'
+        Has $res 'RENAMED src/Orders/Api/Controllers/OrdersController.java -> src/Orders/Api/Controllers/SalesController.java'
+        Has $res 'PROFILE java incremental affected=0/4 (0%) reason=none'
+        HasNot $res '(?m)^CLAIM '
+        $again = Record $r @()
+        ExitIs $again 0
+        $after = Impact $r
+        ExitIs $after 0; Has $after 'RESULT stop'
+        HasNot $after '(?m)^RENAMED '
+    } finally { Drop $r }
+}
+It 'a file moved and changed, or out of a folder its claim names, is still rechecked and never re-pointed' {
+    $r = Fixture
+    try {
+        Hazards $r '`src/Orders/Api/ServiceRegistration.java`'
+        Recorded $r
+        # "Data access goes through ..." names the Data folder the repository leaves.
+        Relocate $r 'src/Orders/Data/OrderRepository.java' 'src/Orders/Persistence/OrderRepository.java'
+        Relocate $r 'src/Orders/Api/ServiceRegistration.java' 'src/Orders/Startup/ServiceRegistration.java'
+        Put (Join-Path $r 'src/Orders/Startup/ServiceRegistration.java') 'final class ServiceRegistration { static void addOrders() {} }'
+        $res = Impact $r
+        ExitIs $res 0
+        Has $res 'RENAMED src/Orders/Data/OrderRepository.java -> src/Orders/Persistence/OrderRepository.java'
+        HasNot $res 'RENAMED src/Orders/Api/'
+        Assert ($res.Out -match '(?m)^CLAIM names-old-path [0-9a-f]{12} java/A2: Data access goes through') "a claim naming the old folder was followed: $($res.Out)"
+        Assert ($res.Out -match '(?m)^CLAIM no-evidence-match [0-9a-f]{12} java/A3: Services are registered') "a moved and changed file was followed: $($res.Out)"
+        $again = Record $r @()
+        ExitIs $again 0
+        $after = Impact $r
+        ExitIs $after 0
+        Assert ($after.Out -match '(?m)^CLAIM names-old-path [0-9a-f]{12} java/A2: ') "record re-pointed a claim that names the old folder: $($after.Out)"
+    } finally { Drop $r }
+}
+It 'a file moved out of the glob its claim rests on is not followed' {
+    $r = Fixture
+    try {
+        Recorded $r
+        Relocate $r 'src/Orders/Api/Controllers/OrdersController.java' 'src/Orders/Api/OrdersController.java'
+        $res = Impact $r
+        ExitIs $res 0
+        Assert ($res.Out -match '(?m)^CLAIM no-evidence-match [0-9a-f]{12} java/A4: Every API controller') "a file that left its glob was followed: $($res.Out)"
+    } finally { Drop $r }
+}
+It 'a corrupt baseline asks for a full run' {
+    $r = Fixture
+    try {
+        Recorded $r
+        Put (Join-Path $r $stateRel) "schema`t99`n"
+        $res = Impact $r
+        ExitIs $res 3; Has $res 'RESULT full'
+    } finally { Drop $r }
+}
+It 'a missing ownership inventory cannot be examined' {
+    $r = Fixture
+    try {
+        Recorded $r
+        Remove-Item -LiteralPath (Join-Path $r 'framework-ownership.json') -Force
+        $res = Impact $r
+        ExitIs $res 2
+        Assert ($res.Out -match 'CANNOT EXAMINE: .*framework-ownership\.json') "no cannot-examine message: $($res.Out)"
+    } finally { Drop $r }
+}
+It 'a directory outside Git cannot be examined' {
+    $r = Join-Path ([IO.Path]::GetTempPath()) ('baseline-nogit-' + [guid]::NewGuid())
+    try {
+        Put (Join-Path $r 'AGENTS.md') (Agents @($claimRepo))
+        $res = Impact $r
+        ExitIs $res 2
+        Assert ($res.Out -match 'CANNOT EXAMINE: ') "no cannot-examine message: $($res.Out)"
+    } finally { Drop $r }
+}
+It 'an unknown mode is refused as invalid' {
+    $r = Fixture
+    try {
+        $res = RunArg $baselinePs @('-Mode', 'Guess', '-Root', $r)
+        ExitIs $res 1
+        Assert ($res.Out -match 'INVALID: ') "no invalid message: $($res.Out)"
+    } finally { Drop $r }
+}
+exit (Write-TestSummary 'BootstrapBaseline.Tests')

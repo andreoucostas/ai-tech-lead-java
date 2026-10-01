@@ -1,0 +1,63 @@
+// Deterministic standards floor - scaffolded by the `enforce-standards` skill.
+// Merge into the evidenced build.gradle.kts (or the convention plugin / allprojects block that already
+// owns the Java configuration). Leanness: do not duplicate what the repository already configures.
+//
+// Every block below is independent and applies only if the team agrees to it or the repository already
+// evidences it. The compiler settings are the floor; the others each need the team's agreement and, for
+// static analysis, an agreed rule set. The Checkstyle, PMD and SpotBugs tasks hang off `check` (and
+// therefore `build`), so the required build must run one of those, not just `test`.
+//
+// A skipped test (@Disabled in JUnit 5, @Ignore in JUnit 4) is not a Gradle setting: the ArchUnit sample
+// scripts/ci/ArchitectureTest.java.sample carries that rule, so it fails the build for every developer and in CI.
+//
+// Brownfield note: if the existing warning count is large, start with specific -Xlint categories (for
+// example "-Xlint:deprecation,unchecked") instead of "-Xlint:all", record the rest in TECH_DEBT.md, and ratchet.
+
+plugins {
+    java
+    checkstyle // only if the team agrees or the repository already evidences it
+    pmd // only if the team agrees or the repository already evidences it
+    // SpotBugs: only if the team agrees or the repository already evidences it. Add the plugin here, for
+    // example id("com.github.spotbugs") version "6.5.12", and see the spotbugs block below.
+}
+
+// Compiler: javac lint warnings fail the build. Keep the repository's evidenced toolchain/release
+// settings; this adds only the lint and fail-on-warning behaviour.
+tasks.withType<JavaCompile>().configureEach {
+    options.compilerArgs.addAll(listOf("-Xlint:all", "-Werror"))
+}
+
+// Checkstyle: any violation of warning severity or higher fails the build. Point configFile at the
+// repository's evidenced Checkstyle configuration (the plugin reads config/checkstyle/checkstyle.xml by
+// default); set toolVersion to the Checkstyle release the repository evidences, because the default
+// release is old and cannot parse newer Java syntax.
+checkstyle {
+    isIgnoreFailures = false
+    maxWarnings = 0
+    // configFile = file("config/checkstyle/checkstyle.xml")
+    // toolVersion = "<evidenced Checkstyle version>"
+}
+
+// PMD: violations fail the build. Point ruleSetFiles at the repository's evidenced PMD rule set (and set
+// ruleSets to an empty list so only that file applies); otherwise the plugin's default rule sets apply.
+// Set toolVersion to a PMD release that reads this repository's Java level: the plugin's default PMD can
+// be older than the class files it analyses, and it then reports processing errors without failing the
+// build, which is a false green. 7.17.0 is shown; use the release the repository evidences.
+pmd {
+    isIgnoreFailures = false
+    toolVersion = "7.17.0"
+    // ruleSets = listOf()
+    // ruleSetFiles = files("config/pmd/ruleset.xml")
+}
+
+// SpotBugs (needs the com.github.spotbugs plugin above): bugs found fail the build.
+// spotbugs {
+//     ignoreFailures.set(false)
+// }
+
+// Dependency convergence (optional, only if the team agrees): fail on conflicting dependency versions.
+// Expect existing conflicts in a brownfield build; resolve them (see `gradle dependencyInsight`) or leave
+// this off.
+// configurations.configureEach {
+//     resolutionStrategy.failOnVersionConflict()
+// }
